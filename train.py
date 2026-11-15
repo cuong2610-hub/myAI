@@ -461,7 +461,7 @@ def load_checkpoint(
     if any(ckpt.get(key) != value for key, value in expected.items()):
         print(
             "Checkpoint không tương thích với kiến trúc hiện tại "
-            f"(AI7-DeepSeek Lite arch {ARCH_VERSION})."
+            f"(AI9-DeepSeek Lite arch {ARCH_VERSION})."
         )
         return 0, float("inf"), False
 

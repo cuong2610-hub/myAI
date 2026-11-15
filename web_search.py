@@ -1,4 +1,4 @@
-"""Internet retrieval for AI7.
+"""Internet retrieval for AI9.
 
 No API key is required. Uses DuckDuckGo HTML search and Wikipedia's public API.
 Designed for Kaggle notebooks with Internet enabled.
@@ -16,7 +16,7 @@ from typing import List, Optional
 from urllib.parse import quote_plus, urljoin, urlparse
 from urllib.request import Request, urlopen
 
-USER_AGENT = "AI7-Web/1.0 (+research project)"
+USER_AGENT = "AI9-Web/1.0 (+research project)"
 DEFAULT_TIMEOUT = 12
 MAX_PAGE_CHARS = 18_000
 

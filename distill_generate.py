@@ -1,6 +1,6 @@
 
 """
-Qwen3-14B 4-bit -> AI7 synthetic SFT dataset generator.
+Qwen3-14B 4-bit -> AI9 synthetic SFT dataset generator.
 
 Thiết kế cho Kaggle:
 - 2 x Tesla T4 14.6 GB

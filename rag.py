@@ -1,6 +1,6 @@
-"""Small dependency-free lexical RAG store for AI7.
+"""Small dependency-free lexical RAG store for AI9.
 
-This is intentionally simple: 46M parameter AI7 does not need another large
+This is intentionally simple: 46M parameter AI9 does not need another large
 embedding model just to remember a few retrieved documents.
 """
 

@@ -14,6 +14,6 @@ PROMPTS = [
     "What does a dictionary do in Python?",
 ]
 
-print("Bộ prompt kiểm thử AI5/AI7. Dùng chat.py để thử trực tiếp.")
+print("Bộ prompt kiểm thử AI5/AI9. Dùng chat.py để thử trực tiếp.")
 for i, p in enumerate(PROMPTS, 1):
     print(f"{i:2d}. {p}")

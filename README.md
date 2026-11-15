@@ -1,4 +1,4 @@
-# AI7
+# AI9
 
 Mô hình ngôn ngữ tiếng Việt nhỏ viết bằng PyTorch, có pretrain, fine-tuning theo hướng dẫn (SFT), chat, tìm web và bộ nhớ RAG. Mô hình hiện cấu hình 46M tham số, context 768 token, tokenizer SentencePiece 16.384 token.
 
@@ -67,4 +67,4 @@ Trong chat: `/web <câu hỏi>` ép tìm web, `/web off` tắt tìm web tự đ�
 
 - `data.txt` hiện là dữ liệu lớn (khoảng 1,4 GB); không cần tải lại nếu đã có.
 - Cần tạo tokenizer và pretrained checkpoint trước lần SFT đầu tiên.
-- `AI8.zip` được giữ nguyên; các lệnh trên không đọc/ghi nội dung ZIP.
+- Các tệp ZIP và dữ liệu/checkpoint lớn bị bỏ qua bởi `.gitignore`.

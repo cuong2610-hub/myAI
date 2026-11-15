@@ -1,4 +1,4 @@
-"""AI7 routing logic: decide when to use local memory or the web."""
+"""AI9 routing logic: decide when to use local memory or the web."""
 
 from __future__ import annotations
 
