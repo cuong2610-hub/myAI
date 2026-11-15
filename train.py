@@ -5,6 +5,7 @@ import os
 import random
 import time
 from datetime import timedelta
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -61,6 +62,27 @@ SEED = 1337
 # as a CPU coordination barrier while rank 0 prepares the pretraining files.
 PREP_TIMEOUT = timedelta(hours=2)
 DDP_TIMEOUT = timedelta(minutes=30)
+
+
+def is_bf16_supported(device=None):
+    """Kiểm tra GPU có hỗ trợ native bfloat16 phần cứng (Ampere trở lên, compute capability >= 8.0).
+
+    torch.cuda.is_bf16_supported() mặc định có including_emulation=True, nên trả về True trên
+    cả GPU Turing (như Tesla T4). Khi đó PyTorch sẽ chạy bf16 bằng giả lập phần mềm rất chậm
+    và GradScaler bị tắt, gây suy giảm hiệu năng và nguy cơ bất ổn định số học.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.is_bf16_supported(including_emulation=False)
+    except TypeError:
+        try:
+            major, _ = torch.cuda.get_device_capability(device)
+            return major >= 8
+        except Exception:
+            return False
+    except Exception:
+        return False
 
 
 def get_dist_env():
@@ -688,7 +710,7 @@ def main():
         use_amp = device.type == "cuda"
         amp_dtype = (
             torch.bfloat16
-            if use_amp and torch.cuda.is_bf16_supported()
+            if use_amp and is_bf16_supported(device)
             else torch.float16
         )
         scaler = torch.amp.GradScaler(
@@ -780,24 +802,30 @@ def main():
             for group in optimizer.param_groups:
                 group["lr"] = lr
 
-            for _ in range(GRAD_ACCUM):
+            for micro_step in range(GRAD_ACCUM):
                 if args.mode == "pretrain":
                     x, y = get_batch(train_data, device, rng)
                 else:
                     x, y = get_sft_batch(rows, device, rng)
 
-                with torch.autocast(
-                    device_type="cuda",
-                    dtype=amp_dtype,
-                    enabled=use_amp,
-                ):
-                    _, loss, _ = model(x, y)
-                    loss = loss / GRAD_ACCUM
+                # Khi dùng DDP, chỉ đồng bộ gradient ở micro-step cuối cùng để tránh
+                # all-reduce lặp lại vô ích ở mỗi micro-step tích lũy gradient.
+                is_accumulating = ddp and (micro_step < GRAD_ACCUM - 1)
+                sync_context = model.no_sync() if is_accumulating else nullcontext()
 
-                if scaler.is_enabled():
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+                with sync_context:
+                    with torch.autocast(
+                        device_type="cuda",
+                        dtype=amp_dtype,
+                        enabled=use_amp,
+                    ):
+                        _, loss, _ = model(x, y)
+                        loss = loss / GRAD_ACCUM
+
+                    if scaler.is_enabled():
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
 
             if scaler.is_enabled():
                 scaler.unscale_(optimizer)

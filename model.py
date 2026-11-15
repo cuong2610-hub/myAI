@@ -233,7 +233,10 @@ class SparseMoE(nn.Module):
         router_logits = self.router(flat)
         probs = torch.softmax(router_logits, dim=-1)
         top_prob, top_idx = torch.topk(probs, k=MOE_TOP_K, dim=-1)
-        top_prob = top_prob / top_prob.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        if MOE_TOP_K > 1:
+            # Chỉ chuẩn hóa lại khi top_k > 1. Với top-1, việc chia cho chính nó
+            # sẽ làm weight luôn bằng 1.0 và triệt tiêu gradient của router từ loss chính.
+            top_prob = top_prob / top_prob.sum(dim=-1, keepdim=True).clamp_min(1e-9)
 
         out = self.shared(flat)
         routed = torch.zeros_like(flat)
