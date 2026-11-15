@@ -1,0 +1,11 @@
+# Generated datasets and training artifacts
+*.zip
+data.txt
+cleaned_data.txt
+instruction_data*.jsonl
+distill_seed_prompts.jsonl
+*_tokens.bin
+*.pth
+state.db
+__pycache__/
+_gen_new/out/
