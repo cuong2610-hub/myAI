@@ -29,6 +29,7 @@ from tokenizer import (
     EOS_ID,
     train_tokenizer,
     load_tokenizer,
+    tokenizer_fingerprint,
     encode,
 )
 
@@ -195,6 +196,7 @@ def build_bins(data_path, sp, force=False):
     wanted = {
         "source": file_fingerprint(data_path),
         "vocab_size": sp.vocab_size(),
+        "tokenizer": tokenizer_fingerprint(),
         "val_ratio": VAL_RATIO,
         "format": 3,
     }
@@ -433,26 +435,83 @@ def build_optimizer(model, device):
         return torch.optim.AdamW(groups, **kwargs)
 
 
-def save_checkpoint(path, model, optimizer, scaler, step, best_val, vocab_size, mode,
-                   sft_val_indices=None):
+def save_checkpoint(
+    path,
+    model,
+    optimizer,
+    scaler,
+    step,
+    best_val,
+    vocab_size,
+    mode,
+    total_steps=None,
+    sft_val_indices=None,
+    tokenizer_fp=None,
+    rng=None,
+    eval_rng=None,
+    extra=None,
+    **kwargs,
+):
     state = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
+    if tokenizer_fp is None:
+        try:
+            tokenizer_fp = tokenizer_fingerprint()
+        except Exception:
+            tokenizer_fp = None
+
     obj = {
         "version": 8,
         "arch_version": ARCH_VERSION,
         "mode": mode,
+        "tokenizer_fingerprint": tokenizer_fp,
         "sft_val_indices": sft_val_indices,
-        "step": step,
+        "step": int(step),
         "model": state,
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict() if scaler.is_enabled() else None,
-        "best_val": best_val,
-        "vocab_size": vocab_size,
+        "best_val": float(best_val),
+        "vocab_size": int(vocab_size),
         "block_size": BLOCK_SIZE,
         "n_embd": N_EMBD,
         "n_head": N_HEAD,
         "n_layer": N_LAYER,
     }
+    if total_steps is not None:
+        obj["total_steps"] = int(total_steps)
+    if rng is not None and hasattr(rng, "bit_generator"):
+        obj["rng_state"] = rng.bit_generator.state
+    if eval_rng is not None and hasattr(eval_rng, "bit_generator"):
+        obj["eval_rng_state"] = eval_rng.bit_generator.state
+    if extra:
+        obj.update(extra)
+
     atomic_save(obj, path)
+
+
+class CheckpointLoadResult(dict):
+    """Kết quả load checkpoint hỗ trợ cả 2 cách sử dụng:
+    1. Unpack như 3-tuple: start_step, best_val, loaded = load_checkpoint(...)
+    2. Truy cập như dict: loaded['loaded'], loaded['reason'], loaded['optimizer_loaded']
+    """
+
+    def __iter__(self):
+        return iter((
+            self.get("start_step", 0),
+            self.get("best_val", float("inf")),
+            self.get("loaded", False),
+        ))
+
+    def __len__(self):
+        return 3
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return (
+                self.get("start_step", 0),
+                self.get("best_val", float("inf")),
+                self.get("loaded", False),
+            )[key]
+        return super().__getitem__(key)
 
 
 def load_checkpoint(
@@ -460,16 +519,46 @@ def load_checkpoint(
     model,
     optimizer,
     scaler,
-    device,
-    mode,
+    device_or_mode,
+    mode=None,
     load_optimizer=True,
+    tokenizer_fp=None,
+    rng=None,
+    eval_rng=None,
+    ckpt=None,
+    **kwargs,
 ):
-    if not os.path.exists(path):
-        return 0, float("inf"), False
+    result = CheckpointLoadResult(
+        loaded=False,
+        reason="",
+        start_step=0,
+        best_val=float("inf"),
+        ckpt_mode=None,
+        optimizer_loaded=False,
+    )
 
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    if isinstance(device_or_mode, str) and device_or_mode in ("pretrain", "sft") and (mode is None or not isinstance(mode, str) or mode not in ("pretrain", "sft")):
+        actual_mode = device_or_mode
+        actual_device = torch.device("cpu")
+        if isinstance(mode, dict) and tokenizer_fp is None:
+            tokenizer_fp = mode
+    else:
+        actual_device = device_or_mode
+        actual_mode = mode
+
+    if ckpt is None:
+        if not os.path.exists(path):
+            result["reason"] = f"Không tìm thấy checkpoint: {path}"
+            return result
+        try:
+            ckpt = torch.load(path, map_location=actual_device, weights_only=False)
+        except Exception as exc:
+            result["reason"] = f"Không đọc được checkpoint {path}: {exc}"
+            return result
+
     if not isinstance(ckpt, dict) or "model" not in ckpt:
-        return 0, float("inf"), False
+        result["reason"] = f"Checkpoint không đúng định dạng: {path}"
+        return result
 
     expected = {
         "arch_version": ARCH_VERSION,
@@ -480,23 +569,60 @@ def load_checkpoint(
         "n_layer": N_LAYER,
     }
 
-    if any(ckpt.get(key) != value for key, value in expected.items()):
-        print(
-            "Checkpoint không tương thích với kiến trúc hiện tại "
-            f"(AI9-DeepSeek Lite arch {ARCH_VERSION})."
-        )
-        return 0, float("inf"), False
+    for key, value in expected.items():
+        if key in ckpt and ckpt[key] != value:
+            msg = (
+                "Checkpoint không tương thích với kiến trúc hiện tại "
+                f"(AI9-DeepSeek Lite arch {ARCH_VERSION}): {key}={ckpt[key]} != {value}."
+            )
+            print(msg)
+            result["reason"] = msg
+            return result
 
     ckpt_mode = ckpt.get("mode")
-    if mode == "pretrain" and ckpt_mode not in (None, "pretrain"):
-        print("Checkpoint SFT không thể dùng để resume pretrain.")
-        return 0, float("inf"), False
+    result["ckpt_mode"] = ckpt_mode
+    if actual_mode == "pretrain" and ckpt_mode not in (None, "pretrain"):
+        msg = f"Checkpoint {path} là SFT ({ckpt_mode}); không thể dùng để resume pretrain."
+        print(msg)
+        result["reason"] = msg
+        return result
 
-    model.load_state_dict(ckpt["model"], strict=True)
+    # Kiểm tra tokenizer fingerprint để tránh tình trạng sau --rebuild-data nạp nhầm checkpoint cũ sinh ra rác
+    target_tok = tokenizer_fp
+    if target_tok is None:
+        try:
+            target_tok = tokenizer_fingerprint()
+        except Exception:
+            target_tok = None
+
+    saved_tok = ckpt.get("tokenizer_fingerprint")
+    if saved_tok and target_tok and saved_tok != target_tok:
+        msg = (
+            f"Tokenizer hiện tại không khớp tokenizer đã dùng cho checkpoint {path} "
+            f"(checkpoint: sha256={saved_tok.get('sha256', '')[:12]}..., "
+            f"hiện tại: sha256={target_tok.get('sha256', '')[:12]}...). "
+            "Sau khi chạy --rebuild-data, tokenizer đã thay đổi nên checkpoint cũ "
+            "không thể dùng tiếp (sinh ra rác). Hãy train lại từ đầu với --from-scratch."
+        )
+        print(f"LỖI: {msg}")
+        result["reason"] = msg
+        return result
+
+    if not saved_tok:
+        print("[WARN] Checkpoint cũ không có tokenizer fingerprint; không thể kiểm tra token ID.")
+
+    try:
+        model.load_state_dict(ckpt["model"], strict=True)
+    except Exception as exc:
+        msg = f"Không nạp được state_dict từ {path}: {exc}"
+        print(msg)
+        result["reason"] = msg
+        return result
 
     if load_optimizer and "optimizer" in ckpt:
         try:
             optimizer.load_state_dict(ckpt["optimizer"])
+            result["optimizer_loaded"] = True
         except Exception as exc:
             print(f"Không khôi phục được optimizer; dùng optimizer mới: {exc}")
 
@@ -506,11 +632,28 @@ def load_checkpoint(
         except Exception:
             pass
 
-    return (
-        int(ckpt.get("step", -1)) + 1,
-        float(ckpt.get("best_val", float("inf"))),
-        True,
+    if load_optimizer and rng is not None and "rng_state" in ckpt:
+        try:
+            rng.bit_generator.state = ckpt["rng_state"]
+        except Exception:
+            pass
+
+    if load_optimizer and eval_rng is not None and "eval_rng_state" in ckpt:
+        try:
+            eval_rng.bit_generator.state = ckpt["eval_rng_state"]
+        except Exception:
+            pass
+
+    start_step = max(0, int(ckpt.get("step", 0)))
+    best_val = float(ckpt.get("best_val", float("inf")))
+
+    result.update(
+        loaded=True,
+        start_step=start_step,
+        best_val=best_val,
+        total_steps=ckpt.get("total_steps"),
     )
+    return result
 
 
 @torch.no_grad()
@@ -877,11 +1020,13 @@ def main():
                             model,
                             optimizer,
                             scaler,
-                            step,
+                            step + 1,
                             best_val,
                             sp.vocab_size(),
                             args.mode,
-                            val_indices if args.mode == "sft" else None,
+                            total_steps=total_steps,
+                            sft_val_indices=val_indices if args.mode == "sft" else None,
+                            rng=rng,
                         )
                         print(f"  -> lưu model tốt nhất: {best_path}")
 
@@ -890,11 +1035,13 @@ def main():
                         model,
                         optimizer,
                         scaler,
-                        step,
+                        step + 1,
                         best_val,
                         sp.vocab_size(),
                         args.mode,
-                        val_indices if args.mode == "sft" else None,
+                        total_steps=total_steps,
+                        sft_val_indices=val_indices if args.mode == "sft" else None,
+                        rng=rng,
                     )
 
                 if ddp:
@@ -906,11 +1053,13 @@ def main():
                 model,
                 optimizer,
                 scaler,
-                last_step,
+                last_step + 1,
                 best_val,
                 sp.vocab_size(),
                 args.mode,
-                val_indices if args.mode == "sft" else None,
+                total_steps=total_steps,
+                sft_val_indices=val_indices if args.mode == "sft" else None,
+                rng=rng,
             )
             print(f"Đã lưu checkpoint cuối: {last_path}")
             print(f"Model tốt nhất: {best_path}")

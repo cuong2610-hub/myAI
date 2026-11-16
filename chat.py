@@ -133,13 +133,61 @@ def _current_block(user_text, context_text, mode):
     return user_text if not context_text else context_text + "\n\n" + user_text
 
 
-def build_prompt(user_text, history, mode, context_text, sp):
-    """Build a prompt that always keeps the current question.
-
-    Old conversation turns are dropped first; if the current turn itself is
-    still too long, the oldest tokens are trimmed but BOS is preserved.
+def _trim_context_to_fit(user_text, context_text, mode, max_prompt_len, sp):
+    """Cắt bớt context_text sao cho lượt hội thoại hiện tại nằm gọn trong max_prompt_len,
+    bảo toàn nguyên vẹn câu hỏi của người dùng và cấu trúc prompt template.
     """
+    if not context_text:
+        return ""
+
     current = _current_block(user_text, context_text, mode)
+    if len(encode(current, sp=sp, add_bos=True)) <= max_prompt_len:
+        return context_text
+
+    empty_block = _current_block(user_text, "", mode)
+    base_len = len(encode(empty_block, sp=sp, add_bos=True))
+    budget = max(0, max_prompt_len - base_len - 10)
+
+    if budget <= 10:
+        return ""
+
+    ctx_tokens = encode(context_text, sp=sp, add_bos=False, add_eos=False)
+    if len(ctx_tokens) > budget:
+        ctx_tokens = ctx_tokens[:budget]
+        context_text = decode(ctx_tokens, sp=sp) + "..."
+
+    while context_text and len(encode(_current_block(user_text, context_text, mode), sp=sp, add_bos=True)) > max_prompt_len:
+        ctx_tokens = ctx_tokens[:-15]
+        if not ctx_tokens:
+            return ""
+        context_text = decode(ctx_tokens, sp=sp) + "..."
+
+    return context_text
+
+
+def build_prompt(user_text, history, mode, context_text, sp, max_new_tokens=220):
+    """Xây dựng prompt đảm bảo prompt + max_new_tokens không vượt quá BLOCK_SIZE (768).
+
+    1. Giới hạn độ dài prompt ở max_prompt_len = BLOCK_SIZE - max_new_tokens.
+    2. Cắt bớt context_text từ tài liệu ngoài nếu lượt hiện tại quá dài,
+       không cắt xén token từ đầu prompt để bảo toàn câu hỏi và marker template.
+    3. Loại bỏ dần các lượt hội thoại cũ trong lịch sử nếu tổng chiều dài vượt ngân sách.
+    """
+    max_prompt_len = max(32, BLOCK_SIZE - max_new_tokens)
+
+    # Cắt context_text cho vừa ngân sách lượt hiện tại
+    if context_text:
+        context_text = _trim_context_to_fit(user_text, context_text, mode, max_prompt_len, sp)
+
+    current = _current_block(user_text, context_text, mode)
+
+    # Nếu ngay cả khi không có context mà user_text vẫn quá dài
+    current_ids = encode(current, sp=sp, add_bos=True)
+    if len(current_ids) > max_prompt_len:
+        while len(user_text) > 20 and len(encode(_current_block(user_text, "", mode), sp=sp, add_bos=True)) > max_prompt_len:
+            user_text = user_text[:int(len(user_text) * 0.9)]
+        current = _current_block(user_text, "", mode)
+
     blocks = []
     if mode == "sft":
         for u, a in history:
@@ -149,23 +197,23 @@ def build_prompt(user_text, history, mode, context_text, sp):
     while True:
         text = "\n".join(blocks + [current]) if mode == "sft" else current
         ids = encode(text, sp=sp, add_bos=True)
-        if len(ids) <= BLOCK_SIZE:
+        if len(ids) <= max_prompt_len:
             return ids
         if blocks:
+            # Bỏ lượt cũ nhất trong lịch sử
             blocks.pop(0)
             continue
-        # The current turn alone is too long. Keep the end (the actual
-        # question) and restore exactly one BOS.
-        return [BOS_ID] + ids[-(BLOCK_SIZE - 1):]
+        # Biện pháp phòng vệ cuối cùng
+        return [BOS_ID] + ids[-(max_prompt_len - 1):]
 
 
 def _clean_answer(text):
+    for marker in ("<|user|>", "<|assistant|>", "</s>"):
+        if marker in text:
+            text = text.split(marker, 1)[0]
     for marker in (
-        "<|user|>",
-        "<|assistant|>",
         "Nguồn 1",
         "Nguồn 2",
-        "</s>",
         "<pad>",
     ):
         text = text.replace(marker, "")
@@ -274,7 +322,7 @@ def main():
             route = None
             context_text = ""
 
-        ids = build_prompt(prompt, history, mode, context_text, sp)
+        ids = build_prompt(prompt, history, mode, context_text, sp, max_new_tokens=args.max_new_tokens)
         if len(ids) == 0:
             print("AI: (prompt rỗng)\n")
             continue
@@ -286,23 +334,40 @@ def main():
             else (0.58 if context_text else 0.68)
         )
 
-        with torch.inference_mode():
-            out = model.generate(
-                context,
-                max_new_tokens=args.max_new_tokens,
-                temperature=temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                repetition_penalty=args.repetition_penalty,
-                eos_id=EOS_ID,
-                min_new_tokens=args.min_new_tokens,
-                pad_id=PAD_ID,
-                use_cache=not args.no_cache,
-            )
+        try:
+            with torch.inference_mode():
+                out = model.generate(
+                    context,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=temperature,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    repetition_penalty=args.repetition_penalty,
+                    eos_id=EOS_ID,
+                    min_new_tokens=args.min_new_tokens,
+                    pad_id=PAD_ID,
+                    use_cache=not args.no_cache,
+                )
+        except KeyboardInterrupt:
+            print("\n(Đã ngắt sinh câu trả lời bằng Ctrl+C)\n")
+            continue
+        except (RuntimeError, Exception) as exc:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"\n[LỖI khi sinh câu trả lời: {exc}]\n")
+            continue
 
         if out.dim() != 2 or out.size(0) != 1:
             raise RuntimeError(f"generate trả về shape bất thường: {tuple(out.shape)}")
         new_ids = out[0].tolist()[len(ids):]
+
+        # Cắt new_ids tại EOS_ID / USER_ID / ASSISTANT_ID đầu tiên để tránh bịa lượt hội thoại kế tiếp
+        stop_ids = {EOS_ID, USER_ID, ASSISTANT_ID}
+        for idx, token_id in enumerate(new_ids):
+            if token_id in stop_ids:
+                new_ids = new_ids[:idx]
+                break
+
         text = _clean_answer(
             decode(
                 new_ids,
@@ -317,7 +382,8 @@ def main():
             if route.web_docs:
                 print(f"[Web] đã đọc {len(route.web_docs)} nguồn.")
             elif route.memory_docs:
-                print(f"[RAG] dùng {len(route.memory_docs)} tài liệu đã lưu.")
+                tag = "[RAG (fallback)]" if route.reason == "web_failed" else "[RAG]"
+                print(f"{tag} dùng {len(route.memory_docs)} tài liệu đã lưu.")
 
         print(f"AI: {text if text else '(không sinh được nội dung)'}\n")
 

@@ -36,6 +36,9 @@ def tokenizer_fingerprint(model_path=MODEL_PATH):
     """
     import hashlib
 
+    if not os.path.exists(model_path):
+        return None
+
     h = hashlib.sha256()
     with open(model_path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -211,6 +214,7 @@ def train_tokenizer(input_path="cleaned_data.txt", vocab_size=VOCAB_SIZE, force=
 
         os.replace(tmp_model, MODEL_PATH)
         os.replace(tmp_vocab, VOCAB_PATH)
+        wanted_meta["fingerprint"] = tokenizer_fingerprint(MODEL_PATH)
         _write_meta(wanted_meta)
     finally:
         for p in (CORPUS_PATH, tmp_prefix + ".model", tmp_prefix + ".vocab"):
