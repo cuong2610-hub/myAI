@@ -3,6 +3,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from datetime import timedelta
 from contextlib import nullcontext
@@ -282,12 +283,16 @@ def file_fingerprint(path):
     return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
 
 
-def get_batch(data, device, rng):
+def get_batch(data, device, rng, batch_size=None, rank=0, world=1):
+    bs = BATCH_SIZE if batch_size is None else batch_size
     max_start = len(data) - BLOCK_SIZE - 1
     if max_start <= 0:
         raise RuntimeError("Dataset nhỏ hơn context window.")
 
-    starts = rng.integers(0, max_start, size=BATCH_SIZE)
+    # Mỗi rank lấy một lát cắt riêng của cùng lượt random để các rank
+    # dùng chung seed không train trên batch giống hệt nhau.
+    starts = rng.integers(0, max_start, size=bs * world)
+    starts = starts[rank * bs : (rank + 1) * bs]
     x = np.stack(
         [np.asarray(data[i : i + BLOCK_SIZE], dtype=np.int64) for i in starts]
     )
@@ -362,8 +367,9 @@ def load_instruction_data(paths, sp):
 
     return rows
 
-def get_sft_batch(rows, device, rng):
-    batch = [rows[int(rng.integers(0, len(rows)))] for _ in range(BATCH_SIZE)]
+def get_sft_batch(rows, device, rng, batch_size=None):
+    bs = BATCH_SIZE if batch_size is None else batch_size
+    batch = [rows[int(rng.integers(0, len(rows)))] for _ in range(bs)]
     max_len = min(BLOCK_SIZE, max(len(tokens) for tokens, _, _ in batch))
     xs, ys = [], []
 
@@ -736,7 +742,17 @@ def atomic_save(obj, path):
     os.replace(tmp, path)
 
 
+def _configure_stdio():
+    """Avoid UnicodeEncodeError when stdout is redirected on Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main():
+    _configure_stdio()
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["pretrain", "sft"], default="pretrain")
     ap.add_argument("--rebuild-data", action="store_true")

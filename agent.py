@@ -50,6 +50,7 @@ class RouteResult:
     reason: str
     memory_docs: List[Dict] = field(default_factory=list)
     web_docs: List[Dict] = field(default_factory=list)
+    query: str = ""
 
     @property
     def context(self) -> str:
@@ -67,7 +68,7 @@ class RouteResult:
                 if u:
                     seen_urls.add(u)
                 merged.append(d)
-        return format_context(merged)
+        return format_context(merged, query=self.query)
 
 
 def needs_web(query: str) -> bool:
@@ -108,10 +109,10 @@ def retrieve_context(query: str, *, force_web: bool = False, use_memory: bool = 
                     add_documents(web_docs)
                 except Exception as exc:
                     print(f"[WARN] Không thể lưu tài liệu web vào RAG: {exc}")
-            return RouteResult(True, "web", mem, web_docs)
+            return RouteResult(True, "web", mem, web_docs, query=query)
         except Exception as exc:
             print(f"[WARN] Tìm kiếm web thất bại ({exc}); fallback về bộ nhớ RAG.")
-            return RouteResult(False, "web_failed", mem, [])
+            return RouteResult(False, "web_failed", mem, [], query=query)
 
     # For normal factual questions, a good memory hit is enough to ground the prompt.
-    return RouteResult(False, reason, mem, [])
+    return RouteResult(False, reason, mem, [], query=query)

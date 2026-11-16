@@ -214,27 +214,64 @@ def _load_index(mtime_ns: int, size: int, ttl: Optional[float] = DEFAULT_TTL):
     return _INDEX
 
 
-def format_context(docs: List[Dict], max_chars: int = 10_000) -> str:
-    chunks = []
-    used = 0
+DEFAULT_CONTEXT_CHARS = 1_800
+
+
+def _cut_at_word(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(" ", 0, limit)
+    if cut < limit // 2:
+        cut = limit
+    return text[:cut].rstrip()
+
+
+def _select_passage(content: str, budget: int, query_tokens: List[str]) -> str:
+    """Chọn đoạn liên quan nhất tới truy vấn trong ngân sách, thay vì luôn lấy đầu trang."""
+    if budget <= 0:
+        return ""
+    if len(content) <= budget:
+        return content
+    if not query_tokens:
+        return _cut_at_word(content, budget)
+
+    stride = max(1, budget // 2)
+    best_start, best_score = 0, -1.0
+    for start in range(0, len(content) - budget + 1, stride):
+        s = _score(query_tokens, _tokens(content[start:start + budget]))
+        if s > best_score:
+            best_start, best_score = start, s
+    return _cut_at_word(content[best_start:best_start + budget], budget)
+
+
+def format_context(docs: List[Dict], max_chars: int = DEFAULT_CONTEXT_CHARS, query: str = "") -> str:
+    """Gộp tài liệu thành ngữ cảnh, chia đều ngân sách ký tự cho mỗi tài liệu.
+
+    Ngân sách mặc định ~1.800 ký tự để không vượt context 768 token của model;
+    chat.py còn cắt chính xác theo token trong build_prompt.
+    """
+    unique = []
     seen_urls = set()
     for d in docs:
         raw_url = d.get("url", "").strip()
         u = raw_url.lower()
         if u and u in seen_urls:
             continue
-        if u:
-            seen_urls.add(u)
-
-        title = sanitize_text(d.get("title", ""))
         content = sanitize_text(d.get("content", ""))
         if not content:
             continue
-        chunk = f"[Nguồn {len(chunks) + 1}] {title}\nURL: {raw_url}\n{content}"
-        remain = max_chars - used
-        if remain <= 0:
-            break
-        chunk = chunk[:remain]
-        chunks.append(chunk)
-        used += len(chunk)
+        if u:
+            seen_urls.add(u)
+        unique.append((sanitize_text(d.get("title", "")), raw_url, content))
+    if not unique:
+        return ""
+
+    query_tokens = _tokens(query)
+    per_doc = max_chars // len(unique)
+    chunks = []
+    for i, (title, raw_url, content) in enumerate(unique, 1):
+        header = f"[Nguồn {i}] {title}\nURL: {raw_url}\n"
+        body = _select_passage(content, per_doc - len(header), query_tokens)
+        if body:
+            chunks.append(header + body)
     return "\n\n".join(chunks)

@@ -9,3 +9,4 @@ distill_seed_prompts.jsonl
 state.db
 __pycache__/
 _gen_new/out/
+memory/
