@@ -138,7 +138,7 @@ def load_seed_prompts(path: str) -> list[str]:
     return result
 
 
-def load_base_questions(path: str) -> list[str]:
+def load_base_questions(path: str) -> list[dict]:
     if not os.path.exists(path):
         return []
 
@@ -159,7 +159,7 @@ def load_base_questions(path: str) -> list[str]:
             question = str(obj.get("user", "")).strip()
 
             if question:
-                result.append(question)
+                result.append({"question": question, "category": str(obj.get("category", "general"))})
 
     return result
 
@@ -220,7 +220,7 @@ def load_existing(path: str):
 # QUESTION POOL
 # ======================================================================
 
-def build_source_pool(seeds: list[str], base: list[str]):
+def build_source_pool(seeds: list[str], base: list[dict]):
     """
     Gộp seed + base questions rồi loại duplicate.
     """
@@ -228,7 +228,9 @@ def build_source_pool(seeds: list[str], base: list[str]):
     pool = []
     seen = set()
 
-    for q in seeds + base:
+    sources = [{"question": q, "category": infer_category(q)} for q in seeds] + base
+    for item in sources:
+        q = item["question"]
         q = normalize_space(q)
 
         if not q:
@@ -243,9 +245,20 @@ def build_source_pool(seeds: list[str], base: list[str]):
             continue
 
         seen.add(key)
-        pool.append(q)
+        category = normalize_space(item.get("category", "general")).lower()
+        if category == "general":
+            category = infer_category(q)
+        pool.append({"question": q, "category": category or "general"})
 
     return pool
+
+
+def infer_category(question: str) -> str:
+    if re.search(r"code|lập trình|python|program|thuật toán", question, re.I):
+        return "code"
+    if re.search(r"toán|tính|phương trình|xác suất|diện tích|chu vi", question, re.I):
+        return "math"
+    return "vietnamese"
 
 
 # ======================================================================
@@ -265,7 +278,7 @@ QUESTION_WRAPPERS = [
 
 
 def make_tasks(
-    source_pool: list[str],
+    source_pool: list[dict],
     count: int,
     seed: int,
 ):
@@ -287,6 +300,15 @@ def make_tasks(
     shuffled = source_pool[:]
     rng.shuffle(shuffled)
 
+    buckets = {}
+    for item in shuffled:
+        buckets.setdefault(item["category"], []).append(item)
+    shuffled = []
+    while any(buckets.values()):
+        for bucket in buckets.values():
+            if bucket:
+                shuffled.append(bucket.pop())
+
     # Nếu target <= số source thì mỗi source chỉ dùng một lần.
     if count <= len(shuffled):
         return shuffled[:count]
@@ -296,7 +318,7 @@ def make_tasks(
 
     # Trước tiên lấy toàn bộ câu gốc.
     for q in shuffled:
-        key = normalize_key(q)
+        key = normalize_key(q["question"])
 
         if key in seen:
             continue
@@ -314,7 +336,8 @@ def make_tasks(
     while len(tasks) < count and attempts < max_attempts:
         attempts += 1
 
-        q = rng.choice(source_pool)
+        item = rng.choice(source_pool)
+        q = item["question"]
         wrapper = rng.choice(QUESTION_WRAPPERS)
 
         candidate = normalize_space(
@@ -327,7 +350,7 @@ def make_tasks(
             continue
 
         seen.add(key)
-        tasks.append(candidate)
+        tasks.append({"question": candidate, "category": item["category"]})
 
     return tasks
 
@@ -436,6 +459,38 @@ def looks_bad_answer(
                 return True, "lặp cụm từ"
 
     return False, ""
+
+
+def looks_self_contradictory(answer: str) -> bool:
+    """Catch explicit opposing claims; this is a conservative text heuristic."""
+    text = normalize_space(answer).lower()
+    patterns = (
+        (r"\bkhông đúng\b", r"\bđúng là\b"),
+        (r"\bkhông thể\b", r"\bcó thể\b"),
+        (r"\bkhông phải\b", r"\blà\b"),
+        (r"\bsai\b", r"\bchính xác\b"),
+    )
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    for i, first in enumerate(sentences):
+        for second in sentences[i + 1:]:
+            if any(re.search(a, first) and re.search(b, second) or re.search(b, first) and re.search(a, second)
+                   for a, b in patterns):
+                shared = set(re.findall(r"\w+", first)) & set(re.findall(r"\w+", second))
+                if len(shared) >= 2:
+                    return True
+    return False
+
+
+def semantic_duplicate(answer: str, previous: list[str], threshold=0.92) -> bool:
+    """Conservative near-duplicate check based on normalized word overlap."""
+    words = set(re.findall(r"\w+", normalize_key(answer)))
+    if len(words) < 8:
+        return False
+    for old in previous:
+        other = set(re.findall(r"\w+", normalize_key(old)))
+        if len(other) >= 8 and len(words & other) / len(words | other) >= threshold:
+            return True
+    return False
 
 
 # ======================================================================
@@ -791,6 +846,41 @@ def save_dataset(
     temp_path.replace(path)
 
 
+def evaluate_dataset(path: str):
+    """Write deterministic, category-specific checks; not a factuality judge."""
+    groups = {"code": [], "math": [], "vietnamese": [], "other": []}
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            q = str(row.get("user", ""))
+            a = str(row.get("assistant", ""))
+            category = str(row.get("category", "")).lower()
+            if category not in groups or category == "general":
+                category = infer_category(q)
+            groups[category].append({"line": line_no, "user": q, "assistant": a})
+    report = {"counts": {k: len(v) for k, v in groups.items()}, "checks": {}}
+    for category, rows in groups.items():
+        if category == "other":
+            continue
+        report["checks"][category] = {
+            "samples": len(rows),
+            "empty_answer": sum(not r["assistant"].strip() for r in rows),
+            "self_contradiction_flags": sum(looks_self_contradictory(r["assistant"]) for r in rows),
+            "code_fence_samples" if category == "code" else "answer_samples": [
+                {"line": r["line"], "user": r["user"], "assistant": r["assistant"][:500]}
+                for r in rows[:20]
+            ],
+        }
+    report_path = str(path) + ".evaluation.json"
+    Path(report_path).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Evaluation report: {report_path} | counts={report['counts']}")
+
+
 # ======================================================================
 # MAIN
 # ======================================================================
@@ -860,7 +950,13 @@ def main():
         action="store_true",
     )
 
+    parser.add_argument("--evaluate", action="store_true", help="Tạo báo cáo review riêng code/toán/tiếng Việt rồi thoát.")
+
     args = parser.parse_args()
+
+    if args.evaluate:
+        evaluate_dataset(args.output)
+        return
 
     # --------------------------------------------------------------
     # Header
@@ -937,7 +1033,9 @@ def main():
 
     task_seen = set()
 
-    for q in tasks:
+    for item in tasks:
+
+        q = item["question"]
 
         key = normalize_key(q)
 
@@ -951,7 +1049,7 @@ def main():
             continue
 
         task_seen.add(key)
-        filtered_tasks.append(q)
+        filtered_tasks.append(item)
 
     tasks = filtered_tasks
 
@@ -994,10 +1092,13 @@ def main():
 
         last_save = time.time()
 
-        for index, question in enumerate(
+        seen_answers = [str(row.get("assistant", "")) for row in existing]
+        for index, task in enumerate(
             tasks,
             1,
         ):
+
+            question = task["question"]
 
             if kept >= args.num_samples:
                 break
@@ -1094,6 +1195,16 @@ def main():
 
                 continue
 
+            if looks_self_contradictory(answer):
+                rejected += 1
+                print("STATUS: BỎ - có dấu hiệu tự mâu thuẫn (heuristic)")
+                continue
+
+            if semantic_duplicate(answer, seen_answers):
+                rejected += 1
+                print("STATUS: BỎ - câu trả lời gần trùng về từ vựng")
+                continue
+
             # ------------------------------------------------------
             # Duplicate question
             # ------------------------------------------------------
@@ -1119,6 +1230,7 @@ def main():
             row = {
                 "user": normalize_space(question),
                 "assistant": normalize_space(answer),
+                "category": task.get("category", "general"),
             }
 
             existing.append(row)
@@ -1126,6 +1238,7 @@ def main():
             seen_questions.add(
                 question_key
             )
+            seen_answers.append(row["assistant"])
 
             kept += 1
 
@@ -1170,6 +1283,7 @@ def main():
             args.output,
             existing,
         )
+        evaluate_dataset(args.output)
 
         print()
         print("=" * 70)

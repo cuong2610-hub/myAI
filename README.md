@@ -43,7 +43,7 @@ Tạo dữ liệu hướng dẫn (mặc định tối đa 1.500 mẫu; có thể
 python distill_generate.py --num-samples 1500
 ```
 
-Fine-tune. Nếu `deepseek_distill.jsonl` tồn tại, script tự ghép nó với `instruction_data.jsonl`:
+Fine-tune. Nếu `qwen3_distill.jsonl` tồn tại, script tự ghép nó với `instruction_data.jsonl`:
 
 ```bash
 python train.py --mode sft --max-steps 2000

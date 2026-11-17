@@ -334,20 +334,53 @@ def main():
             else (0.58 if context_text else 0.68)
         )
 
+        print("AI: ", end="", flush=True)
+        generated_ids = []
+        past = None
+        was_training = model.training
+        model.eval()
         try:
             with torch.inference_mode():
-                out = model.generate(
-                    context,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=temperature,
-                    top_k=args.top_k,
-                    top_p=args.top_p,
-                    repetition_penalty=args.repetition_penalty,
-                    eos_id=EOS_ID,
-                    min_new_tokens=args.min_new_tokens,
-                    pad_id=PAD_ID,
-                    use_cache=not args.no_cache,
-                )
+                for step in range(args.max_new_tokens):
+                    if args.no_cache:
+                        model_input = torch.cat((context, torch.tensor([generated_ids], device=device)), dim=1) if generated_ids else context
+                        logits, _, _ = model(model_input[:, -model.block_size:])
+                    else:
+                        model_input = context if past is None else torch.tensor([[generated_ids[-1]]], device=device)
+                        logits, _, past = model(model_input, past_key_values=past, use_cache=True)
+
+                    logits = logits[:, -1, :].float()
+                    if args.repetition_penalty != 1.0:
+                        seen = set(ids + generated_ids)
+                        vals = logits[0, list(seen)]
+                        logits[0, list(seen)] = torch.where(
+                            vals < 0, vals * args.repetition_penalty, vals / args.repetition_penalty
+                        )
+                    logits[:, PAD_ID] = -float("inf")
+                    if step < args.min_new_tokens:
+                        logits[:, EOS_ID] = -float("inf")
+                    if temperature <= 0:
+                        next_id = int(logits.argmax(dim=-1).item())
+                    else:
+                        logits = logits / temperature
+                        if args.top_k and 0 < args.top_k < logits.size(-1):
+                            cutoff = torch.topk(logits, args.top_k).values[:, -1:]
+                            logits[logits < cutoff] = -float("inf")
+                        if 0 < args.top_p < 1:
+                            vals, indices = torch.sort(logits, descending=True, dim=-1)
+                            probs = torch.softmax(vals, dim=-1)
+                            remove = torch.cumsum(probs, dim=-1) > args.top_p
+                            remove[:, 1:] = remove[:, :-1].clone()
+                            remove[:, 0] = False
+                            vals[remove] = -float("inf")
+                            logits = torch.full_like(logits, -float("inf")).scatter(1, indices, vals)
+                        next_id = int(torch.multinomial(torch.softmax(logits, dim=-1), 1).item())
+                    if next_id in {EOS_ID, USER_ID, ASSISTANT_ID}:
+                        break
+                    generated_ids.append(next_id)
+                    partial = _clean_answer(decode(generated_ids, sp, skip_ids=(PAD_ID, UNK_ID, BOS_ID, EOS_ID, USER_ID, ASSISTANT_ID)))
+                    print("\rAI: " + partial, end="", flush=True)
+                print()
         except KeyboardInterrupt:
             print("\n(Đã ngắt sinh câu trả lời bằng Ctrl+C)\n")
             continue
@@ -356,17 +389,10 @@ def main():
                 torch.cuda.empty_cache()
             print(f"\n[LỖI khi sinh câu trả lời: {exc}]\n")
             continue
+        finally:
+            model.train(was_training)
 
-        if out.dim() != 2 or out.size(0) != 1:
-            raise RuntimeError(f"generate trả về shape bất thường: {tuple(out.shape)}")
-        new_ids = out[0].tolist()[len(ids):]
-
-        # Cắt new_ids tại EOS_ID / USER_ID / ASSISTANT_ID đầu tiên để tránh bịa lượt hội thoại kế tiếp
-        stop_ids = {EOS_ID, USER_ID, ASSISTANT_ID}
-        for idx, token_id in enumerate(new_ids):
-            if token_id in stop_ids:
-                new_ids = new_ids[:idx]
-                break
+        new_ids = generated_ids
 
         text = _clean_answer(
             decode(
@@ -385,7 +411,9 @@ def main():
                 tag = "[RAG (fallback)]" if route.reason == "web_failed" else "[RAG]"
                 print(f"{tag} dùng {len(route.memory_docs)} tài liệu đã lưu.")
 
-        print(f"AI: {text if text else '(không sinh được nội dung)'}\n")
+        if not text:
+            print("AI: (không sinh được nội dung)")
+        print()
 
 
 if __name__ == "__main__":

@@ -44,7 +44,7 @@ PRETRAIN_BEST = "pretrain_best.pth"
 SFT_LAST = "instruct_last.pth"
 SFT_BEST = "instruct_best.pth"
 INSTRUCTION_PATH = "instruction_data.jsonl"
-DISTILL_PATH = "deepseek_distill.jsonl"
+DISTILL_PATH = "qwen3_distill.jsonl"
 
 BATCH_SIZE = 4
 GRAD_ACCUM = 8
@@ -199,7 +199,7 @@ def build_bins(data_path, sp, force=False):
         "vocab_size": sp.vocab_size(),
         "tokenizer": tokenizer_fingerprint(),
         "val_ratio": VAL_RATIO,
-        "format": 3,
+        "format": 4,
     }
 
     meta = None
@@ -217,7 +217,7 @@ def build_bins(data_path, sp, force=False):
         if os.path.exists(path):
             os.remove(path)
 
-    print("[3/3] Tokenize toàn bộ dataset theo streaming...")
+    print("[3/3] Chia tài liệu rồi tokenize theo streaming...")
     rng = random.Random(SEED)
     train_count = 0
     val_count = 0
@@ -233,15 +233,15 @@ def build_bins(data_path, sp, force=False):
             errors="replace",
             buffering=8 * 1024 * 1024,
         ) as f:
-            for line_no, line in enumerate(f, 1):
-                line = line.replace("\r", "").replace("\x00", "").strip()
-                if len(line) < 2:
-                    continue
+            document = []
 
-                ids = sp.encode(line, out_type=int)
+            def emit_document(lines):
+                nonlocal train_count, val_count
+                if not lines:
+                    return
+                ids = sp.encode(" ".join(lines), out_type=int)
                 if len(ids) < 2:
-                    continue
-
+                    return
                 seq = [BOS_ID] + ids + [EOS_ID]
                 if rng.random() < VAL_RATIO:
                     val_buf.extend(seq)
@@ -258,10 +258,18 @@ def build_bins(data_path, sp, force=False):
                     np.asarray(val_buf, dtype=np.uint16).tofile(val_f)
                     val_buf.clear()
 
+            for line_no, line in enumerate(f, 1):
+                line = line.replace("\r", "").replace("\x00", "").strip()
+                if not line:
+                    emit_document(document)
+                    document = []
+                elif len(line) >= 2:
+                    document.append(line)
                 if line_no % 250_000 == 0:
                     print(
                         f"{line_no:,} dòng | train {train_count:,} | val {val_count:,}"
                     )
+            emit_document(document)
 
         if train_buf:
             np.asarray(train_buf, dtype=np.uint16).tofile(train_f)
@@ -313,7 +321,7 @@ def get_batch(data, device, rng, batch_size=None, rank=0, world=1):
     return x, y
 
 
-def load_instruction_data(paths, sp):
+def load_instruction_data(paths, sp, verbose=True):
     if isinstance(paths, (str, os.PathLike)):
         paths = [paths]
 
@@ -322,11 +330,14 @@ def load_instruction_data(paths, sp):
         if not os.path.exists(path):
             raise FileNotFoundError(path)
 
+        kept = 0
+        total = 0
         with open(path, "r", encoding="utf-8") as f:
             for line_no, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
+                total += 1
 
                 try:
                     obj = json.loads(line)
@@ -361,6 +372,12 @@ def load_instruction_data(paths, sp):
                 assistant_start = len(prefix)
 
                 rows.append((tokens, assistant_start, tuple(prefix)))
+                kept += 1
+
+        if verbose:
+            print(f"[SFT] {path}: nạp {kept}/{total} mẫu hợp lệ")
+            if kept == 0:
+                print(f"[WARN] {path} không đóng góp mẫu SFT hợp lệ nào.")
 
     if not rows:
         raise RuntimeError("Không có mẫu SFT hợp lệ.")
@@ -850,7 +867,7 @@ def main():
             sft_paths = list(args.sft_data) if args.sft_data else [INSTRUCTION_PATH]
             if args.sft_data is None and os.path.exists(DISTILL_PATH):
                 sft_paths.append(DISTILL_PATH)
-            rows = load_instruction_data(sft_paths, sp)
+            rows = load_instruction_data(sft_paths, sp, verbose=(rank == 0))
             resume_path = args.checkpoint or (SFT_LAST if os.path.exists(SFT_LAST) else PRETRAIN_BEST)
             saved_val_indices = None
             if os.path.basename(resume_path) in (SFT_LAST, SFT_BEST) and os.path.exists(resume_path):
