@@ -10,3 +10,10 @@ state.db
 __pycache__/
 _gen_new/out/
 memory/
+
+# English edition artifacts (additive; the original edition is untouched)
+checkpoints_en/
+data_en/
+tokenizer_en/
+runs_en/
+memory_en/

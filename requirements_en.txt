@@ -1,0 +1,9 @@
+# English edition dependencies.
+#
+# torch is lower-bounded only: Kaggle already provides a CUDA build that
+# matches its image, and reinstalling it wastes session time.
+torch>=2.1
+datasets>=2.19
+sentencepiece>=0.1.99
+numpy>=1.24
+pyarrow>=14.0

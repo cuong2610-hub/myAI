@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# AI9-DeepSeek Lite
 # Inspired by ideas used in DeepSeek-family models, but intentionally kept small
 # enough for a 2x Tesla T4 training setup.
 BLOCK_SIZE = 768
