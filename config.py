@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 ARCH_VERSION = 1
-"""Architecture version for English checkpoints.  Independent of the Vietnamese
-edition's ``ARCH_VERSION`` so the two checkpoint families cannot be confused."""
+"""Architecture version for English checkpoints.  Kept independent of any legacy
+checkpoint format so the two families cannot be confused."""
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

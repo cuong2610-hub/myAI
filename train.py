@@ -1,1105 +1,912 @@
+"""Resumable English pretraining on streaming FineWeb-Edu.
+
+Single-GPU example::
+
+    python -m english.train --preset base --amp auto
+
+Dual-T4 (Kaggle) example::
+
+    torchrun --nproc_per_node=2 -m english.train \
+        --preset base --plan-tokens 5000000000 --amp fp16
+
+The script never downloads the full corpus: Hugging Face ``streaming=True`` is
+used and the shuffle buffer lives in this process (and in the checkpoint).
+"""
+
+from __future__ import annotations
+
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
 import sys
 import time
-from datetime import timedelta
-from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.nn as nn
 
-from model import (
-    GPTLanguageModel,
-    ARCH_VERSION,
-    BLOCK_SIZE,
-    N_EMBD,
-    N_HEAD,
-    N_LAYER,
+from .checkpoint import (
+    CheckpointError,
+    load_checkpoint,
+    save_checkpoint,
 )
-from preprocess import preprocess
-from tokenizer import (
-    VOCAB_SIZE,
-    PAD_ID,
+from .config import (
+    BASE_CONFIG,
+    DEFAULT_CHECKPOINT_DIR,
+    DEFAULT_DATA_DIR,
+    DEFAULT_DATASET,
+    DEFAULT_DATASET_CONFIG,
+    DEFAULT_RUNS_DIR,
+    DEFAULT_SPLIT,
+    DEFAULT_TOKENIZER_DIR,
+    TINY_CONFIG,
+    ModelConfig,
+    ensure_dir,
+    get_preset,
+    with_overrides,
+)
+from .data import (
+    DocumentStream,
+    PackedTokenStream,
+    RetryConfig,
+    SyntheticDocumentStream,
+    batch_from_bin,
+    build_val_tokens,
+    load_val_tokens,
+)
+from .model import GPT
+from .tokenizer import (
     BOS_ID,
     EOS_ID,
-    train_tokenizer,
     load_tokenizer,
     tokenizer_fingerprint,
-    encode,
+    train_tokenizer,
+)
+from .utils import (
+    JsonlLogger,
+    StopFlag,
+    autocast_context,
+    barrier,
+    build_optimizer,
+    capture_rng_state,
+    cleanup_distributed,
+    configure_stdio,
+    distributed_mean,
+    gather_object,
+    get_dist_env,
+    gpu_memory,
+    human_bytes,
+    init_gloo,
+    init_nccl,
+    is_distributed,
+    lr_at_tokens,
+    make_grad_scaler,
+    resolve_amp,
+    restore_rng_state,
+    seed_everything,
+    unwrap_model,
 )
 
-DATA_PATH = "data.txt"
-CLEAN_PATH = "cleaned_data.txt"
-TRAIN_BIN = "train_tokens.bin"
-VAL_BIN = "val_tokens.bin"
-META_PATH = "data_meta.json"
-PRETRAIN_LAST = "pretrain_last.pth"
-PRETRAIN_BEST = "pretrain_best.pth"
-SFT_LAST = "instruct_last.pth"
-SFT_BEST = "instruct_best.pth"
-INSTRUCTION_PATH = "instruction_data.jsonl"
-DISTILL_PATH = "qwen3_distill.jsonl"
+BASE_PARAMS = 124_278_528
+SMOKE_TEXTS = (
+    "The quick brown fox jumps over the lazy dog near the river bank.",
+    "Machine learning models learn patterns from large collections of text.",
+    "A transformer uses attention to connect distant words in a sentence.",
+    "Python is a popular programming language for data science and research.",
+    "The training loop updates model weights with gradient descent.",
+    "SentencePiece converts text into a sequence of subword tokens.",
+    "Careful evaluation prevents overfitting to the training distribution.",
+    "A small model can still produce coherent English paragraphs.",
+    "Graphics processing units accelerate matrix multiplication.",
+    "The validation loss should decrease as the model learns.",
+    "Data pipelines stream documents without storing the whole dataset.",
+    "Checkpoints preserve the optimizer, random state and data position.",
+    "A good tokenizer balances vocabulary size against sequence length.",
+    "Temperature and top-p sampling control the diversity of generated text.",
+    "Retrieval augmented generation grounds answers in retrieved documents.",
+    "The English edition is self-contained and independent.",
+)
 
-BATCH_SIZE = 4
-GRAD_ACCUM = 8
-MAX_TRAIN_TOKENS = 500_000_000
-SFT_STEPS = 2000
-EVAL_INTERVAL = 250
-EVAL_ITERS = 20
-LEARNING_RATE = 1.5e-4
-MIN_LR = 1.5e-5
-WARMUP_STEPS = 300
-WEIGHT_DECAY = 0.1
-GRAD_CLIP = 1.0
-VAL_RATIO = 0.01
-SEED = 1337
-
-# Long preprocessing happens before NCCL is initialized. Gloo is used only
-# as a CPU coordination barrier while rank 0 prepares the pretraining files.
-PREP_TIMEOUT = timedelta(hours=2)
-DDP_TIMEOUT = timedelta(minutes=30)
+SMOKE_WORDS = (
+    "the quick brown fox jumps over lazy dog machine learning transformer "
+    "attention python code computer science model language data training neural "
+    "network gradient token embedding sentence english text example value system "
+    "user assistant river bank matrix vector probability sampling temperature "
+    "validation checkpoint streaming dataset retrieval document paragraph"
+).split()
 
 
-def is_bf16_supported(device=None):
-    """Kiểm tra GPU có hỗ trợ native bfloat16 phần cứng (Ampere trở lên, compute capability >= 8.0).
+# ---------------------------------------------------------------------------
+# Arguments and plan
+# ---------------------------------------------------------------------------
 
-    torch.cuda.is_bf16_supported() mặc định có including_emulation=True, nên trả về True trên
-    cả GPU Turing (như Tesla T4). Khi đó PyTorch sẽ chạy bf16 bằng giả lập phần mềm rất chậm
-    và GradScaler bị tắt, gây suy giảm hiệu năng và nguy cơ bất ổn định số học.
-    """
-    if not torch.cuda.is_available():
-        return False
-    try:
-        return torch.cuda.is_bf16_supported(including_emulation=False)
-    except TypeError:
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description="English GPT pretraining (streaming FineWeb-Edu).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("--preset", choices=["tiny", "base", "wide"], default="base")
+    ap.add_argument("--n-layer", type=int, default=None)
+    ap.add_argument("--n-head", type=int, default=None)
+    ap.add_argument("--n-embd", type=int, default=None)
+    ap.add_argument("--n-inner", type=int, default=None)
+    ap.add_argument("--block-size", type=int, default=None)
+    ap.add_argument("--vocab-size", type=int, default=None)
+    ap.add_argument("--dropout", type=float, default=None)
+
+    ap.add_argument("--tokenizer", default=str(DEFAULT_TOKENIZER_DIR / "tokenizer.model"))
+    ap.add_argument("--tokenizer-dir", default=str(DEFAULT_TOKENIZER_DIR))
+    ap.add_argument("--checkpoint-dir", default=str(DEFAULT_CHECKPOINT_DIR))
+    ap.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
+    ap.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
+
+    ap.add_argument("--dataset", default=DEFAULT_DATASET)
+    ap.add_argument("--dataset-config", default=DEFAULT_DATASET_CONFIG)
+    ap.add_argument("--split", default=DEFAULT_SPLIT)
+    ap.add_argument("--data-source", default=None, help="Local JSONL file or dataset id.")
+    ap.add_argument("--val-fraction", type=float, default=0.01)
+    ap.add_argument("--val-tokens", type=int, default=1_000_000)
+    ap.add_argument("--min-chars", type=int, default=64)
+    ap.add_argument("--max-chars", type=int, default=200_000)
+    ap.add_argument("--shuffle-buffer", type=int, default=1000)
+    ap.add_argument("--max-doc-tokens", type=int, default=8192)
+
+    ap.add_argument("--batch-size", type=int, default=8, help="per GPU")
+    ap.add_argument("--grad-accum", type=int, default=4)
+    ap.add_argument("--plan-tokens", type=int, default=5_000_000_000)
+    ap.add_argument("--max-steps", type=int, default=0)
+    ap.add_argument("--lr", type=float, default=6e-4)
+    ap.add_argument("--min-lr", type=float, default=6e-5)
+    ap.add_argument("--warmup-tokens", type=int, default=100_000_000)
+    ap.add_argument("--weight-decay", type=float, default=0.1)
+    ap.add_argument("--grad-clip", type=float, default=1.0)
+    ap.add_argument("--amp", choices=["auto", "fp16", "bf16", "off"], default="auto")
+    ap.add_argument("--seed", type=int, default=1337)
+
+    ap.add_argument("--eval-every", type=int, default=500)
+    ap.add_argument("--eval-iters", type=int, default=50)
+    ap.add_argument("--save-every", type=int, default=500)
+    ap.add_argument("--log-every", type=int, default=10)
+
+    ap.add_argument("--resume", default="", help="Checkpoint path, or 'auto'.")
+    ap.add_argument("--from-scratch", action="store_true")
+    ap.add_argument("--allow-data-restart", action="store_true")
+    ap.add_argument("--smoke-test", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--expect-params", type=int, default=0)
+    return ap
+
+
+def resolve_config(args: argparse.Namespace) -> ModelConfig:
+    cfg = get_preset(args.preset)
+    cfg = with_overrides(
+        cfg,
+        n_layer=args.n_layer,
+        n_head=args.n_head,
+        n_embd=args.n_embd,
+        n_inner=args.n_inner,
+        block_size=args.block_size,
+        vocab_size=args.vocab_size,
+        dropout=args.dropout,
+    )
+    return cfg
+
+
+def apply_smoke_defaults(args: argparse.Namespace) -> None:
+    if not args.smoke_test:
+        return
+    args.preset = "tiny"
+    args.batch_size = 2
+    args.grad_accum = 1
+    args.plan_tokens = 100_000
+    if args.max_steps <= 0:
+        args.max_steps = 12
+    args.lr = 3e-3
+    args.min_lr = 3e-4
+    args.warmup_tokens = 512
+    args.eval_every = 2
+    args.save_every = 2
+    args.log_every = 1
+    args.eval_iters = 2
+    args.min_chars = 10
+    args.max_chars = 20_000
+    args.shuffle_buffer = 8
+    args.max_doc_tokens = 256
+    args.val_tokens = 20_000
+    args.val_fraction = 0.1
+    args.amp = "auto"
+
+
+# ---------------------------------------------------------------------------
+# Assets
+# ---------------------------------------------------------------------------
+
+
+def resolve_source(args: argparse.Namespace) -> Tuple[str, Optional[str]]:
+    source = args.data_source or args.dataset
+    if os.path.exists(str(source)):
+        return str(source), None
+    return str(source), args.dataset_config
+
+
+def val_asset_key(args: argparse.Namespace, cfg: ModelConfig, tokenizer_sha: str) -> str:
+    source, config = resolve_source(args)
+    stat_key: Dict[str, Any] = {}
+    if os.path.exists(source):
+        st = os.stat(source)
+        stat_key = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    key = {
+        "format": 1,
+        "source": os.path.abspath(source) if os.path.exists(source) else source,
+        "config": config,
+        "split": args.split,
+        "val_fraction": args.val_fraction,
+        "block_size": cfg.block_size,
+        "val_tokens": args.val_tokens,
+        "tokenizer_sha": tokenizer_sha,
+        "stat": stat_key,
+    }
+    raw = json.dumps(key, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def smoke_tokenizer_corpus(path: Path, seed: int = 1337, lines: int = 20_000) -> Path:
+    rng = random.Random(seed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for _ in range(lines):
+            n = rng.randint(8, 28)
+            words = [rng.choice(SMOKE_WORDS) for _ in range(n)]
+            f.write(" ".join(words) + ".\n")
+    return path
+
+
+def ensure_smoke_tokenizer(directory: Path, vocab_size: int, seed: int) -> Path:
+    model_path = directory / "tokenizer.model"
+    if model_path.exists():
         try:
-            major, _ = torch.cuda.get_device_capability(device)
-            return major >= 8
+            sp = load_tokenizer(model_path, expected_vocab=vocab_size)
+            if int(sp.vocab_size()) == vocab_size:
+                return model_path
         except Exception:
-            return False
-    except Exception:
-        return False
-
-
-def get_dist_env():
-    if "RANK" not in os.environ:
-        return False, 0, 0, 1
-    return (
-        True,
-        int(os.environ["RANK"]),
-        int(os.environ["LOCAL_RANK"]),
-        int(os.environ["WORLD_SIZE"]),
+            pass
+    corpus = directory / "corpus_smoke.txt"
+    if not corpus.exists():
+        smoke_tokenizer_corpus(corpus, seed=seed)
+    path = train_tokenizer(
+        corpus_path=corpus,
+        out_dir=directory,
+        vocab_size=vocab_size,
+        force=True,
+        num_threads=2,
     )
+    load_tokenizer(path, expected_vocab=vocab_size)
+    return path
 
 
-def initialize_nccl(rank, local_rank, world):
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "DDP training yêu cầu CUDA/NCCL, nhưng CUDA không khả dụng. "
-            "Hãy bật GPU trong Kaggle Session Options."
-        )
-
-    device_count = torch.cuda.device_count()
-    if local_rank < 0 or local_rank >= device_count:
-        raise RuntimeError(
-            f"LOCAL_RANK={local_rank} không hợp lệ; chỉ nhìn thấy {device_count} GPU."
-        )
-
-    # Explicit mapping: rank 0 -> cuda:0, rank 1 -> cuda:1, ...
-    torch.cuda.set_device(local_rank)
-
-    # device_id prevents NCCL from guessing the process-to-GPU mapping.
-    dist.init_process_group(
-        backend="nccl",
-        init_method="env://",
-        rank=rank,
-        world_size=world,
-        timeout=DDP_TIMEOUT,
-        device_id=local_rank,
-    )
-
-    current = torch.cuda.current_device()
-    if current != local_rank:
-        raise RuntimeError(
-            f"DDP mapping lỗi: rank {rank} đang ở cuda:{current}, "
-            f"nhưng LOCAL_RANK={local_rank}."
-        )
+def smoke_documents(seed: int, count: int = 400) -> List[str]:
+    rng = random.Random(seed + 17)
+    docs: List[str] = []
+    for _ in range(count):
+        n = rng.randint(80, 220)
+        words = [rng.choice(SMOKE_WORDS) for _ in range(n)]
+        docs.append(" ".join(words) + ".")
+    return docs
 
 
-def prepare_pretrain_assets(rank, world, force=False):
-    """Prepare preprocessing/tokenizer/bin files BEFORE NCCL starts.
+def build_synthetic_val_tokens(sp, cfg: ModelConfig, seed: int) -> np.ndarray:
+    if int(sp.vocab_size()) > 65535:
+        raise ValueError("synthetic validation tokens use uint16")
+    ids: List[int] = []
+    for text in smoke_documents(seed, count=120):
+        ids.append(BOS_ID)
+        ids.extend(int(i) for i in sp.encode(text, out_type=int))
+        ids.append(EOS_ID)
+    minimum = cfg.block_size * 64 + 2
+    while len(ids) < minimum:
+        ids.extend(ids[:minimum - len(ids)])
+    return np.asarray(ids, dtype=np.uint16)
 
-    In multi-GPU runs rank 0 does all expensive file work while every other
-    rank waits in a CPU Gloo process group. This avoids NCCL barrier timeouts.
-    """
+
+def prepare_assets(
+    args: argparse.Namespace,
+    cfg: ModelConfig,
+    rank: int,
+    world: int,
+) -> Tuple[Path, Optional[Path], Optional[Path], Optional[np.ndarray]]:
+    """Create tokenizer/validation assets before NCCL starts (rank 0 only work)."""
     ddp = world > 1
-
     if ddp:
-        # Temporary CPU-only rendezvous. No CUDA/NCCL is touched here.
-        dist.init_process_group(
-            backend="gloo",
-            init_method="env://",
-            rank=rank,
-            world_size=world,
-            timeout=PREP_TIMEOUT,
-        )
-
+        init_gloo(rank, world, timeout_minutes=180)
+    tokenizer_path = Path(args.tokenizer)
+    if args.smoke_test:
+        # Every rank must agree on the smoke tokenizer path.
+        tokenizer_path = Path(args.tokenizer_dir) / "smoke" / "tokenizer.model"
+    val_bin: Optional[Path] = None
+    val_meta: Optional[Path] = None
+    synthetic_val: Optional[np.ndarray] = None
     try:
         if rank == 0:
-            # Rebuild means start the entire data pipeline over. Otherwise,
-            # reuse already prepared files whenever possible.
-            if force:
-                print("[1/3] Làm sạch data.txt...")
-                if not os.path.exists(DATA_PATH):
-                    raise FileNotFoundError(
-                        "Không tìm thấy data.txt để rebuild. "
-                        "Hãy thêm data.txt vào /kaggle/working/ hoặc bỏ --rebuild-data."
-                    )
-                preprocess(DATA_PATH, CLEAN_PATH)
-            elif not os.path.exists(CLEAN_PATH):
-                print("[1/3] cleaned_data.txt chưa có, đang làm sạch data.txt...")
-                if not os.path.exists(DATA_PATH):
-                    raise FileNotFoundError("Không tìm thấy data.txt.")
-                preprocess(DATA_PATH, CLEAN_PATH)
-
-            if force or not os.path.exists("tokenizer.model") or not os.path.exists("tokenizer.vocab"):
-                print("[2/3] Huấn luyện SentencePiece...")
-                train_tokenizer(CLEAN_PATH, VOCAB_SIZE, force=force)
-            else:
-                print("[2/3] Dùng tokenizer hiện có.")
-
-            sp = load_tokenizer()
-
-            # Build memmap bins here, still outside NCCL.
-            build_bins(
-                CLEAN_PATH,
-                sp,
-                force=force,
-            )
-        else:
-            sp = None
-
-        # Rank 1 waits on Gloo (CPU), not NCCL/GPU.
-        if ddp:
-            dist.barrier()
-    finally:
-        if ddp and dist.is_initialized():
-            dist.destroy_process_group()
-
-
-def build_bins(data_path, sp, force=False):
-    wanted = {
-        "source": file_fingerprint(data_path),
-        "vocab_size": sp.vocab_size(),
-        "tokenizer": tokenizer_fingerprint(),
-        "val_ratio": VAL_RATIO,
-        "format": 4,
-    }
-
-    meta = None
-    if not force and os.path.exists(META_PATH):
-        try:
-            meta = json.loads(Path(META_PATH).read_text(encoding="utf-8"))
-        except Exception:
-            meta = None
-
-    if meta == wanted and os.path.exists(TRAIN_BIN) and os.path.exists(VAL_BIN):
-        print("[3/3] Dữ liệu tokenized đã tồn tại, dùng lại.")
-        return
-
-    for path in (TRAIN_BIN, VAL_BIN):
-        if os.path.exists(path):
-            os.remove(path)
-
-    print("[3/3] Chia tài liệu rồi tokenize theo streaming...")
-    rng = random.Random(SEED)
-    train_count = 0
-    val_count = 0
-    train_f = open(TRAIN_BIN, "wb", buffering=8 * 1024 * 1024)
-    val_f = open(VAL_BIN, "wb", buffering=8 * 1024 * 1024)
-    train_buf, val_buf = [], []
-
-    try:
-        with open(
-            data_path,
-            "r",
-            encoding="utf-8",
-            errors="replace",
-            buffering=8 * 1024 * 1024,
-        ) as f:
-            document = []
-
-            def emit_document(lines):
-                nonlocal train_count, val_count
-                if not lines:
-                    return
-                ids = sp.encode(" ".join(lines), out_type=int)
-                if len(ids) < 2:
-                    return
-                seq = [BOS_ID] + ids + [EOS_ID]
-                if rng.random() < VAL_RATIO:
-                    val_buf.extend(seq)
-                    val_count += len(seq)
-                else:
-                    train_buf.extend(seq)
-                    train_count += len(seq)
-
-                if len(train_buf) >= 1_000_000:
-                    np.asarray(train_buf, dtype=np.uint16).tofile(train_f)
-                    train_buf.clear()
-
-                if len(val_buf) >= 1_000_000:
-                    np.asarray(val_buf, dtype=np.uint16).tofile(val_f)
-                    val_buf.clear()
-
-            for line_no, line in enumerate(f, 1):
-                line = line.replace("\r", "").replace("\x00", "").strip()
-                if not line:
-                    emit_document(document)
-                    document = []
-                elif len(line) >= 2:
-                    document.append(line)
-                if line_no % 250_000 == 0:
-                    print(
-                        f"{line_no:,} dòng | train {train_count:,} | val {val_count:,}"
-                    )
-            emit_document(document)
-
-        if train_buf:
-            np.asarray(train_buf, dtype=np.uint16).tofile(train_f)
-        if val_buf:
-            np.asarray(val_buf, dtype=np.uint16).tofile(val_f)
-    finally:
-        train_f.close()
-        val_f.close()
-
-    Path(META_PATH).write_text(
-        json.dumps(wanted, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    print(f"Đã tạo token: train {train_count:,} | val {val_count:,}")
-
-
-def file_fingerprint(path):
-    st = os.stat(path)
-    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
-
-
-def get_batch(data, device, rng, batch_size=None, rank=0, world=1):
-    bs = BATCH_SIZE if batch_size is None else batch_size
-    max_start = len(data) - BLOCK_SIZE - 1
-    if max_start <= 0:
-        raise RuntimeError("Dataset nhỏ hơn context window.")
-
-    # Mỗi rank lấy một lát cắt riêng của cùng lượt random để các rank
-    # dùng chung seed không train trên batch giống hệt nhau.
-    starts = rng.integers(0, max_start, size=bs * world)
-    starts = starts[rank * bs : (rank + 1) * bs]
-    x = np.stack(
-        [np.asarray(data[i : i + BLOCK_SIZE], dtype=np.int64) for i in starts]
-    )
-    y = np.stack(
-        [np.asarray(data[i + 1 : i + BLOCK_SIZE + 1], dtype=np.int64) for i in starts]
-    )
-
-    x = torch.from_numpy(x)
-    y = torch.from_numpy(y)
-
-    if device.type == "cuda":
-        x = x.pin_memory().to(device, non_blocking=True)
-        y = y.pin_memory().to(device, non_blocking=True)
-    else:
-        x = x.to(device)
-        y = y.to(device)
-
-    return x, y
-
-
-def load_instruction_data(paths, sp, verbose=True):
-    if isinstance(paths, (str, os.PathLike)):
-        paths = [paths]
-
-    rows = []
-    for path in paths:
-        if not os.path.exists(path):
-            raise FileNotFoundError(path)
-
-        kept = 0
-        total = 0
-        with open(path, "r", encoding="utf-8") as f:
-            for line_no, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                total += 1
-
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        f"JSONL lỗi ở {path}, dòng {line_no}: {exc}"
-                    ) from exc
-
-                user = str(obj.get("user", "")).strip()
-                assistant = str(obj.get("assistant", "")).strip()
-                if not user or not assistant:
-                    continue
-
-                text = f"<|user|>\n{user}\n<|assistant|>\n{assistant}"
-                tokens = encode(text, sp=sp, add_bos=True, add_eos=True)
-                if len(tokens) < 3:
-                    continue
-
-                prefix = encode(
-                    f"<|user|>\n{user}\n<|assistant|>\n",
-                    sp=sp,
-                    add_bos=True,
+            if args.smoke_test:
+                tokenizer_path = ensure_smoke_tokenizer(
+                    Path(args.tokenizer_dir) / "smoke", cfg.vocab_size, args.seed
                 )
-                if len(prefix) >= BLOCK_SIZE or len(tokens) <= len(prefix):
-                    continue
-
-                # Trim prompt first; very long answers may also lose their earliest tokens.
-                if len(tokens) > BLOCK_SIZE:
-                    trim = len(tokens) - BLOCK_SIZE
-                    tokens = [tokens[0]] + tokens[trim + 1:]
-                    prefix = [prefix[0]] + prefix[trim + 1:]
-                assistant_start = len(prefix)
-
-                rows.append((tokens, assistant_start, tuple(prefix)))
-                kept += 1
-
-        if verbose:
-            print(f"[SFT] {path}: nạp {kept}/{total} mẫu hợp lệ")
-            if kept == 0:
-                print(f"[WARN] {path} không đóng góp mẫu SFT hợp lệ nào.")
-
-    if not rows:
-        raise RuntimeError("Không có mẫu SFT hợp lệ.")
-
-    return rows
-
-def get_sft_batch(rows, device, rng, batch_size=None):
-    bs = BATCH_SIZE if batch_size is None else batch_size
-    batch = [rows[int(rng.integers(0, len(rows)))] for _ in range(bs)]
-    max_len = min(BLOCK_SIZE, max(len(tokens) for tokens, _, _ in batch))
-    xs, ys = [], []
-
-    for tokens, assistant_start, _ in batch:
-        tokens = tokens[:max_len]
-        x = tokens[:-1]
-        y = tokens[1:]
-
-        mask_start = max(0, assistant_start - 1)
-        labels = [
-            token if j >= mask_start else -100
-            for j, token in enumerate(y)
-        ]
-
-        x += [PAD_ID] * (max_len - 1 - len(x))
-        labels += [-100] * (max_len - 1 - len(labels))
-        xs.append(x)
-        ys.append(labels)
-
-    x = torch.tensor(xs, dtype=torch.long, device=device)
-    y = torch.tensor(ys, dtype=torch.long, device=device)
-    return x, y
-
-
-def get_lr(step, total_steps):
-    if step < WARMUP_STEPS:
-        return LEARNING_RATE * (step + 1) / WARMUP_STEPS
-
-    progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
-    progress = min(max(progress, 0.0), 1.0)
-    return MIN_LR + 0.5 * (LEARNING_RATE - MIN_LR) * (
-        1 + math.cos(math.pi * progress)
-    )
+            if not tokenizer_path.exists():
+                raise FileNotFoundError(
+                    f"English tokenizer not found: {tokenizer_path}\n"
+                    "Train it first:\n"
+                    "  python -m english.tokenizer --train --sample-mb 200 --vocab-size 32768"
+                )
+            sp = load_tokenizer(tokenizer_path, expected_vocab=cfg.vocab_size)
+            if args.smoke_test:
+                synthetic_val = build_synthetic_val_tokens(sp, cfg, args.seed)
+            else:
+                sha = tokenizer_fingerprint(tokenizer_path)["sha256"]
+                digest = val_asset_key(args, cfg, sha)
+                val_dir = ensure_dir(Path(args.data_dir) / "val")
+                val_bin = val_dir / f"val_{digest}.bin"
+                val_meta = val_dir / f"val_{digest}.json"
+                source, config = resolve_source(args)
+                print(f"[data] Preparing validation tokens ({args.val_tokens:,}) ...", flush=True)
+                started = time.time()
+                meta = build_val_tokens(
+                    val_bin,
+                    val_meta,
+                    sp,
+                    block_size=cfg.block_size,
+                    max_tokens=args.val_tokens,
+                    source=source,
+                    config=config,
+                    split=args.split,
+                    val_fraction=args.val_fraction,
+                    seed=args.seed,
+                    tokenizer_sha=sha,
+                )
+                print(
+                    f"[data] Validation tokens ready: {meta['tokens']:,} tokens "
+                    f"from {meta['documents']:,} held-out documents "
+                    f"({time.time() - started:.1f}s)",
+                    flush=True,
+                )
+        if ddp:
+            barrier()
+        if rank != 0 and not args.smoke_test:
+            sha = tokenizer_fingerprint(tokenizer_path)["sha256"]
+            digest = val_asset_key(args, cfg, sha)
+            val_dir = Path(args.data_dir) / "val"
+            val_bin = val_dir / f"val_{digest}.bin"
+            val_meta = val_dir / f"val_{digest}.json"
+    finally:
+        if ddp and is_distributed():
+            cleanup_distributed()
+    return tokenizer_path, val_bin, val_meta, synthetic_val
 
 
-def build_optimizer(model, device):
-    decay, no_decay = [], []
-
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if (
-            param.ndim >= 2
-            and "norm" not in name.lower()
-            and "embedding" not in name.lower()
-        ):
-            decay.append(param)
-        else:
-            no_decay.append(param)
-
-    groups = [
-        {"params": decay, "weight_decay": WEIGHT_DECAY},
-        {"params": no_decay, "weight_decay": 0.0},
-    ]
-
-    kwargs = {
-        "lr": LEARNING_RATE,
-        "betas": (0.9, 0.95),
-        "eps": 1e-8,
-    }
-
-    if device.type == "cuda":
-        kwargs["fused"] = True
-
-    try:
-        return torch.optim.AdamW(groups, **kwargs)
-    except TypeError:
-        kwargs.pop("fused", None)
-        return torch.optim.AdamW(groups, **kwargs)
+# ---------------------------------------------------------------------------
+# Data / evaluation
+# ---------------------------------------------------------------------------
 
 
-def save_checkpoint(
-    path,
-    model,
-    optimizer,
-    scaler,
-    step,
-    best_val,
-    vocab_size,
-    mode,
-    total_steps=None,
-    sft_val_indices=None,
-    tokenizer_fp=None,
-    rng=None,
-    eval_rng=None,
-    extra=None,
-    **kwargs,
-):
-    state = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
-    if tokenizer_fp is None:
-        try:
-            tokenizer_fp = tokenizer_fingerprint()
-        except Exception:
-            tokenizer_fp = None
-
-    obj = {
-        "version": 8,
-        "arch_version": ARCH_VERSION,
-        "mode": mode,
-        "tokenizer_fingerprint": tokenizer_fp,
-        "sft_val_indices": sft_val_indices,
-        "step": int(step),
-        "model": state,
-        "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict() if scaler.is_enabled() else None,
-        "best_val": float(best_val),
-        "vocab_size": int(vocab_size),
-        "block_size": BLOCK_SIZE,
-        "n_embd": N_EMBD,
-        "n_head": N_HEAD,
-        "n_layer": N_LAYER,
-    }
-    if total_steps is not None:
-        obj["total_steps"] = int(total_steps)
-    if rng is not None and hasattr(rng, "bit_generator"):
-        obj["rng_state"] = rng.bit_generator.state
-    if eval_rng is not None and hasattr(eval_rng, "bit_generator"):
-        obj["eval_rng_state"] = eval_rng.bit_generator.state
-    if extra:
-        obj.update(extra)
-
-    atomic_save(obj, path)
-
-
-class CheckpointLoadResult(dict):
-    """Kết quả load checkpoint hỗ trợ cả 2 cách sử dụng:
-    1. Unpack như 3-tuple: start_step, best_val, loaded = load_checkpoint(...)
-    2. Truy cập như dict: loaded['loaded'], loaded['reason'], loaded['optimizer_loaded']
-    """
-
-    def __iter__(self):
-        return iter((
-            self.get("start_step", 0),
-            self.get("best_val", float("inf")),
-            self.get("loaded", False),
-        ))
-
-    def __len__(self):
-        return 3
-
-    def __getitem__(self, key):
-        if isinstance(key, int):
-            return (
-                self.get("start_step", 0),
-                self.get("best_val", float("inf")),
-                self.get("loaded", False),
-            )[key]
-        return super().__getitem__(key)
-
-
-def load_checkpoint(
-    path,
-    model,
-    optimizer,
-    scaler,
-    device_or_mode,
-    mode=None,
-    load_optimizer=True,
-    tokenizer_fp=None,
-    rng=None,
-    eval_rng=None,
-    ckpt=None,
-    **kwargs,
-):
-    result = CheckpointLoadResult(
-        loaded=False,
-        reason="",
-        start_step=0,
-        best_val=float("inf"),
-        ckpt_mode=None,
-        optimizer_loaded=False,
-    )
-
-    if isinstance(device_or_mode, str) and device_or_mode in ("pretrain", "sft") and (mode is None or not isinstance(mode, str) or mode not in ("pretrain", "sft")):
-        actual_mode = device_or_mode
-        actual_device = torch.device("cpu")
-        if isinstance(mode, dict) and tokenizer_fp is None:
-            tokenizer_fp = mode
-    else:
-        actual_device = device_or_mode
-        actual_mode = mode
-
-    if ckpt is None:
-        if not os.path.exists(path):
-            result["reason"] = f"Không tìm thấy checkpoint: {path}"
-            return result
-        try:
-            ckpt = torch.load(path, map_location=actual_device, weights_only=False)
-        except Exception as exc:
-            result["reason"] = f"Không đọc được checkpoint {path}: {exc}"
-            return result
-
-    if not isinstance(ckpt, dict) or "model" not in ckpt:
-        result["reason"] = f"Checkpoint không đúng định dạng: {path}"
-        return result
-
-    expected = {
-        "arch_version": ARCH_VERSION,
-        "vocab_size": model.vocab_size,
-        "block_size": BLOCK_SIZE,
-        "n_embd": N_EMBD,
-        "n_head": N_HEAD,
-        "n_layer": N_LAYER,
-    }
-
-    for key, value in expected.items():
-        if key in ckpt and ckpt[key] != value:
-            msg = (
-                "Checkpoint không tương thích với kiến trúc hiện tại "
-                f"(AI9-DeepSeek Lite arch {ARCH_VERSION}): {key}={ckpt[key]} != {value}."
-            )
-            print(msg)
-            result["reason"] = msg
-            return result
-
-    ckpt_mode = ckpt.get("mode")
-    result["ckpt_mode"] = ckpt_mode
-    if actual_mode == "pretrain" and ckpt_mode not in (None, "pretrain"):
-        msg = f"Checkpoint {path} là SFT ({ckpt_mode}); không thể dùng để resume pretrain."
-        print(msg)
-        result["reason"] = msg
-        return result
-
-    # Kiểm tra tokenizer fingerprint để tránh tình trạng sau --rebuild-data nạp nhầm checkpoint cũ sinh ra rác
-    target_tok = tokenizer_fp
-    if target_tok is None:
-        try:
-            target_tok = tokenizer_fingerprint()
-        except Exception:
-            target_tok = None
-
-    saved_tok = ckpt.get("tokenizer_fingerprint")
-    if saved_tok and target_tok and saved_tok != target_tok:
-        msg = (
-            f"Tokenizer hiện tại không khớp tokenizer đã dùng cho checkpoint {path} "
-            f"(checkpoint: sha256={saved_tok.get('sha256', '')[:12]}..., "
-            f"hiện tại: sha256={target_tok.get('sha256', '')[:12]}...). "
-            "Sau khi chạy --rebuild-data, tokenizer đã thay đổi nên checkpoint cũ "
-            "không thể dùng tiếp (sinh ra rác). Hãy train lại từ đầu với --from-scratch."
+def build_packed_stream(args: argparse.Namespace, sp, cfg: ModelConfig, rank: int, world: int) -> PackedTokenStream:
+    if args.smoke_test:
+        docs = SyntheticDocumentStream(
+            smoke_documents(args.seed),
+            seed=args.seed,
+            shuffle_buffer=args.shuffle_buffer,
+            repeat=True,
+            val_fraction=0.0,
+            mode="train",
         )
-        print(f"LỖI: {msg}")
-        result["reason"] = msg
-        return result
-
-    if not saved_tok:
-        print("[WARN] Checkpoint cũ không có tokenizer fingerprint; không thể kiểm tra token ID.")
-
-    try:
-        model.load_state_dict(ckpt["model"], strict=True)
-    except Exception as exc:
-        msg = f"Không nạp được state_dict từ {path}: {exc}"
-        print(msg)
-        result["reason"] = msg
-        return result
-
-    if load_optimizer and "optimizer" in ckpt:
-        try:
-            optimizer.load_state_dict(ckpt["optimizer"])
-            result["optimizer_loaded"] = True
-        except Exception as exc:
-            print(f"Không khôi phục được optimizer; dùng optimizer mới: {exc}")
-
-    if load_optimizer and scaler.is_enabled() and ckpt.get("scaler"):
-        try:
-            scaler.load_state_dict(ckpt["scaler"])
-        except Exception:
-            pass
-
-    if load_optimizer and rng is not None and "rng_state" in ckpt:
-        try:
-            rng.bit_generator.state = ckpt["rng_state"]
-        except Exception:
-            pass
-
-    if load_optimizer and eval_rng is not None and "eval_rng_state" in ckpt:
-        try:
-            eval_rng.bit_generator.state = ckpt["eval_rng_state"]
-        except Exception:
-            pass
-
-    start_step = max(0, int(ckpt.get("step", 0)))
-    best_val = float(ckpt.get("best_val", float("inf")))
-
-    result.update(
-        loaded=True,
-        start_step=start_step,
-        best_val=best_val,
-        total_steps=ckpt.get("total_steps"),
-    )
-    return result
+    else:
+        source, config = resolve_source(args)
+        docs = DocumentStream(
+            source=source,
+            config=config,
+            split=args.split,
+            world_size=world,
+            rank=rank,
+            val_fraction=args.val_fraction,
+            mode="train",
+            shuffle_buffer=args.shuffle_buffer,
+            seed=args.seed,
+            min_chars=args.min_chars,
+            max_chars=args.max_chars,
+            retry=RetryConfig(),
+        )
+    return PackedTokenStream(docs, sp, cfg.block_size, max_doc_tokens=args.max_doc_tokens)
 
 
 @torch.no_grad()
-def eval_pretrain(model, train_data, val_data, device, rng):
+def evaluate(
+    model: nn.Module,
+    data: np.ndarray,
+    cfg: ModelConfig,
+    device: torch.device,
+    iters: int,
+    batch_size: int,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    seed: int,
+) -> float:
+    rng = np.random.default_rng(seed)
+    was_training = model.training
     model.eval()
-    values = {}
-
-    for name, data in (("train", train_data), ("val", val_data)):
-        vals = []
-        for _ in range(EVAL_ITERS):
-            x, y = get_batch(data, device, rng)
+    losses: List[float] = []
+    for _ in range(max(1, int(iters))):
+        x, y = batch_from_bin(data, cfg.block_size, batch_size, rng, device)
+        with autocast_context(device, amp_dtype, use_amp):
             _, loss, _ = model(x, y)
-            vals.append(loss.item())
-        values[name] = sum(vals) / len(vals)
-
-    model.train()
-    return values
-
-
-@torch.no_grad()
-def eval_sft(model, rows, device, rng):
-    model.eval()
-    vals = []
-
-    for _ in range(min(EVAL_ITERS, max(1, len(rows)))):
-        x, y = get_sft_batch(rows, device, rng)
-        _, loss, _ = model(x, y)
-        vals.append(loss.item())
-
-    model.train()
-    return sum(vals) / len(vals)
+        losses.append(float(loss.detach().float().item()))
+    if was_training:
+        model.train()
+    value = sum(losses) / len(losses)
+    return distributed_mean(value, device)
 
 
-def split_sft_rows(rows, seed=SEED, val_ratio=0.05, val_indices=None):
-    if len(rows) < 2:
-        raise RuntimeError("SFT cần ít nhất 2 mẫu để tách train/validation.")
-    if val_indices is None:
-        groups = {}
-        for i, row in enumerate(rows):
-            groups.setdefault(row[2], []).append(i)
-        keys = list(groups)
-        np.random.default_rng(seed).shuffle(keys)
-        val_indices = []
-        target = max(1, int(len(rows) * val_ratio))
-        for key in keys:
-            if len(val_indices) + len(groups[key]) >= len(rows):
-                continue
-            val_indices.extend(groups[key])
-            if len(val_indices) >= target:
-                break
-    val_idx = set(val_indices)
-    if not val_idx or min(val_idx) < 0 or max(val_idx) >= len(rows) or len(val_idx) == len(rows):
-        raise ValueError("Chỉ số validation trong checkpoint không khớp dữ liệu SFT hiện tại.")
-    val_prompts = {rows[i][2] for i in val_idx}
-    if any((row[2] in val_prompts) != (i in val_idx) for i, row in enumerate(rows)):
-        raise ValueError("Checkpoint chia các câu hỏi trùng nhau giữa train và validation; hãy bắt đầu SFT mới.")
-    if len(val_idx) == len(rows):
-        raise ValueError("Không thể chia SFT: toàn bộ mẫu có cùng câu hỏi.")
-    return ([row for i, row in enumerate(rows) if i not in val_idx],
-            [row for i, row in enumerate(rows) if i in val_idx], sorted(val_idx))
+def _format_seconds(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds / 3600:.1f}h"
 
 
-def cleanup_distributed():
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
 
 
-def seed_everything(seed, rank=0):
-    seed += rank * 100003
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def atomic_save(obj, path):
-    tmp = f"{path}.tmp.{os.getpid()}"
-    torch.save(obj, tmp)
-    os.replace(tmp, path)
-
-
-def _configure_stdio():
-    """Avoid UnicodeEncodeError when stdout is redirected on Windows."""
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
-
-
-def main():
-    _configure_stdio()
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["pretrain", "sft"], default="pretrain")
-    ap.add_argument("--rebuild-data", action="store_true")
-    ap.add_argument("--from-scratch", action="store_true")
-    ap.add_argument("--max-tokens", type=int, default=MAX_TRAIN_TOKENS)
-    ap.add_argument("--max-steps", type=int, default=0)
-    ap.add_argument("--checkpoint", default="")
-    ap.add_argument("--sft-data", nargs="+", default=None, help="Một hoặc nhiều JSONL dùng cho SFT.")
-    ap.add_argument("--smoke-test", action="store_true")
-    args = ap.parse_args()
+def main(argv: Optional[List[str]] = None) -> int:
+    configure_stdio()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    apply_smoke_defaults(args)
+    cfg = resolve_config(args)
 
     ddp, rank, local_rank, world = get_dist_env()
+    if world > 1 and not torch.cuda.is_available():
+        raise SystemExit("Distributed training requires CUDA/NCCL; no CUDA device found.")
 
-    if ddp and args.mode == "pretrain" and not args.smoke_test:
-        # IMPORTANT: prepare all large files BEFORE initializing NCCL.
-        # Only rank 0 touches the data; other ranks wait in CPU/Gloo.
-        prepare_pretrain_assets(
-            rank=rank,
-            world=world,
-            force=args.rebuild_data,
+    device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
+    is_main = rank == 0
+    smoke = bool(args.smoke_test)
+
+    ckpt_dir = ensure_dir(Path(args.checkpoint_dir) / ("smoke" if smoke else ""))
+    runs_dir = ensure_dir(Path(args.runs_dir))
+    last_path = ckpt_dir / "pretrain_last.pth"
+    best_path = ckpt_dir / "pretrain_best.pth"
+
+    # Parameter count check happens before any heavy work.
+    formula = cfg.param_count()
+    if args.preset == "base" and all(
+        v is None
+        for v in (args.n_layer, args.n_head, args.n_embd, args.n_inner, args.block_size, args.vocab_size)
+    ):
+        if formula != BASE_PARAMS:
+            raise SystemExit(f"Internal error: base parameter formula {formula} != {BASE_PARAMS}")
+    if args.expect_params and formula != args.expect_params:
+        raise SystemExit(f"Parameter count {formula:,} != --expect-params {args.expect_params:,}")
+
+    tokens_per_step = args.batch_size * args.grad_accum * cfg.block_size * max(1, world)
+    if args.plan_tokens < tokens_per_step:
+        raise SystemExit("--plan-tokens must be at least one optimizer step of tokens")
+    plan_steps = int(math.ceil(args.plan_tokens / tokens_per_step))
+    total_steps = plan_steps if args.max_steps <= 0 else min(plan_steps, args.max_steps)
+
+    if is_main:
+        print("=" * 78)
+        print("English edition pretraining")
+        print(f"  preset              : {args.preset}")
+        print(f"  config              : {cfg.n_layer}L / {cfg.n_embd}d / {cfg.n_head}h / "
+              f"ctx {cfg.block_size} / vocab {cfg.vocab_size} / SwiGLU {cfg.n_inner}")
+        print(f"  exact parameters    : {formula:,}"
+              + ("  (base contract OK)" if formula == BASE_PARAMS else ""))
+        print(f"  devices             : {world} x {device.type}"
+              + (f" ({torch.cuda.get_device_name(local_rank)})" if device.type == "cuda" else ""))
+        print(f"  batch / accumulation: {args.batch_size} x {args.grad_accum}"
+              f" (global {tokens_per_step:,} tokens/step)")
+        print(f"  token plan          : {args.plan_tokens:,} tokens "
+              f"({plan_steps:,} steps" + (f", capped at {total_steps:,}" if total_steps != plan_steps else "") + ")")
+        print(f"  learning rate       : {args.lr:g} -> {args.min_lr:g} "
+              f"(warmup {args.warmup_tokens:,} tokens)")
+        if not smoke:
+            rough_hours = args.plan_tokens / 8000.0 / 3600.0
+            print(f"  rough compute       : ~{rough_hours:.1f} GPU-hours of 2xT4 time "
+                  "(exact speed varies; resumable)")
+        print(f"  last checkpoint     : {last_path}")
+        print("=" * 78, flush=True)
+
+    if args.dry_run:
+        if is_main:
+            print("[dry-run] No tokenizer, dataset or checkpoint was touched.")
+        return 0
+
+    tokenizer_path, val_bin, val_meta, synthetic_val = prepare_assets(args, cfg, rank, world)
+    sp = load_tokenizer(tokenizer_path, expected_vocab=cfg.vocab_size)
+    tok_fp = tokenizer_fingerprint(tokenizer_path)
+
+    if val_bin is not None:
+        val_data = load_val_tokens(
+            val_bin,
+            val_meta,  # type: ignore[arg-type]
+            tokenizer_sha=tok_fp["sha256"],
+            block_size=cfg.block_size,
         )
-
-    elif not ddp and args.mode == "pretrain" and not args.smoke_test:
-        # Single-GPU / CPU preparation.
-        prepare_pretrain_assets(rank=0, world=1, force=args.rebuild_data)
-
-    # SFT intentionally does NOT touch data.txt or the Wikipedia token bins.
-    if ddp:
-        initialize_nccl(rank, local_rank, world)
-        device = torch.device(f"cuda:{local_rank}")
+    elif args.smoke_test:
+        val_data = (
+            synthetic_val
+            if synthetic_val is not None
+            else build_synthetic_val_tokens(sp, cfg, args.seed)
+        )
     else:
-        if not torch.cuda.is_available():
-            device = torch.device("cpu")
-        else:
-            torch.cuda.set_device(0)
-            device = torch.device("cuda:0")
+        raise RuntimeError("No validation data was prepared")
 
-    try:
-        seed_everything(SEED, rank)
+    seed_everything(args.seed, rank)
+    if world > 1:
+        device = init_nccl(rank, local_rank, world)
+    elif device.type == "cuda":
+        torch.cuda.set_device(local_rank)
 
-        if device.type == "cuda":
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.set_float32_matmul_precision("high")
+    use_amp, amp_dtype, scaler_enabled = resolve_amp(args.amp, device)
+    if is_main:
+        print(f"[amp] enabled={use_amp} dtype={amp_dtype} grad_scaler={scaler_enabled}", flush=True)
 
-        if args.smoke_test:
-            model = GPTLanguageModel(VOCAB_SIZE).to(device)
-            model.train()
-            x = torch.randint(0, VOCAB_SIZE, (2, min(BLOCK_SIZE, 64)), device=device)
-            y = torch.randint(0, VOCAB_SIZE, x.shape, device=device)
-            logits, loss, _ = model(x, y)
-            loss.backward()
-            if rank == 0:
-                params = sum(p.numel() for p in model.parameters())
-                print(f"SMOKE TEST: loss={loss.item():.4f} | logits={tuple(logits.shape)} | params={params:,}")
-                print("SMOKE TEST PASS")
-            return
+    model = GPT(cfg).to(device)
+    actual_params = sum(p.numel() for p in model.parameters())
+    if actual_params != formula:
+        raise SystemExit(f"Model has {actual_params:,} parameters, formula says {formula:,}")
+    if is_main:
+        print(f"[model] built {actual_params:,} parameters", flush=True)
 
-        # Tokenizer must exist for both modes.
-        try:
-            sp = load_tokenizer()
-        except Exception as exc:
-            raise RuntimeError(
-                "Không tải được tokenizer. Hãy chạy pretrain/preprocess trước để "
-                "tạo tokenizer.model và tokenizer.vocab."
-            ) from exc
+    optimizer = build_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
+    scaler = make_grad_scaler(scaler_enabled)
 
-        if args.mode == "sft" and args.from_scratch:
-            raise ValueError(
-                "SFT phải bắt đầu từ checkpoint pretrained; không dùng --from-scratch."
-            )
-
-        if args.mode == "pretrain":
-            if not os.path.exists(TRAIN_BIN) or not os.path.exists(VAL_BIN):
-                # This normally means the preparation step was skipped or failed.
-                if not os.path.exists(DATA_PATH):
-                    raise FileNotFoundError(
-                        "Không tìm thấy data.txt và cũng không có train_tokens.bin/val_tokens.bin."
-                    )
-                raise FileNotFoundError(
-                    "Thiếu train_tokens.bin/val_tokens.bin. Hãy chạy lại với --rebuild-data."
-                )
-
-            train_data = np.memmap(TRAIN_BIN, dtype=np.uint16, mode="r")
-            val_data = np.memmap(VAL_BIN, dtype=np.uint16, mode="r")
-            total_tokens = args.max_tokens
-            effective_tokens = BATCH_SIZE * BLOCK_SIZE * GRAD_ACCUM * world
-            total_steps = args.max_steps or max(1, total_tokens // effective_tokens)
-            last_path = PRETRAIN_LAST
-            best_path = PRETRAIN_BEST
-            rng = np.random.default_rng(SEED + 17 * rank)
-            rows = None
-
-        else:
-            sft_paths = list(args.sft_data) if args.sft_data else [INSTRUCTION_PATH]
-            if args.sft_data is None and os.path.exists(DISTILL_PATH):
-                sft_paths.append(DISTILL_PATH)
-            rows = load_instruction_data(sft_paths, sp, verbose=(rank == 0))
-            resume_path = args.checkpoint or (SFT_LAST if os.path.exists(SFT_LAST) else PRETRAIN_BEST)
-            saved_val_indices = None
-            if os.path.basename(resume_path) in (SFT_LAST, SFT_BEST) and os.path.exists(resume_path):
-                saved_val_indices = torch.load(resume_path, map_location="cpu", weights_only=False).get("sft_val_indices")
-            rows, val_rows, val_indices = split_sft_rows(rows, val_indices=saved_val_indices)
-            train_data = None
-            val_data = None
-            effective_tokens = BATCH_SIZE * BLOCK_SIZE * GRAD_ACCUM * world
-            total_steps = args.max_steps or SFT_STEPS
-            last_path = SFT_LAST
-            best_path = SFT_BEST
-            rng = np.random.default_rng(SEED + 97 * rank)
-
-        model = GPTLanguageModel(sp.vocab_size()).to(device)
-        optimizer = build_optimizer(model, device)
-        use_amp = device.type == "cuda"
-        amp_dtype = (
-            torch.bfloat16
-            if use_amp and is_bf16_supported(device)
-            else torch.float16
-        )
-        scaler = torch.amp.GradScaler(
-            "cuda",
-            enabled=use_amp and amp_dtype == torch.float16,
+    if world > 1:
+        model = nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
         )
 
-        if args.checkpoint:
-            checkpoint = args.checkpoint
-        elif args.mode == "sft":
-            checkpoint = SFT_LAST if os.path.exists(SFT_LAST) else PRETRAIN_BEST
-        else:
-            checkpoint = PRETRAIN_LAST
+    packed = build_packed_stream(args, sp, cfg, rank, world)
+    logger = JsonlLogger(runs_dir / ("smoke.jsonl" if smoke else "pretrain.jsonl"))
+    stop = StopFlag()
+    stop.install()
 
-        if args.from_scratch:
-            start_step = 0
-            best_val = float("inf")
-        else:
-            # When starting SFT from pretrain_best.pth, load ONLY model weights
-            # and use a fresh SFT optimizer/schedule. When resuming an SFT
-            # checkpoint, restore optimizer/scaler/step as usual.
-            sft_from_pretrain = (
-                args.mode == "sft"
-                and os.path.basename(checkpoint) in (PRETRAIN_BEST, PRETRAIN_LAST)
-                and os.path.exists(checkpoint)
-            )
-            start_step, best_val, loaded = load_checkpoint(
-                checkpoint,
+    step = 0
+    tokens_seen = 0
+    best_val = float("inf")
+    history: List[Dict[str, Any]] = []
+    data_mode = "fresh"
+    resume_path = ""
+
+    if not args.from_scratch:
+        if args.resume:
+            resume_path = str(last_path if args.resume == "auto" else args.resume)
+        elif last_path.exists():
+            resume_path = str(last_path)
+        if resume_path and not Path(resume_path).exists() and args.resume not in ("", "auto"):
+            raise SystemExit(f"--resume checkpoint not found: {resume_path}")
+        if resume_path and Path(resume_path).exists():
+            loaded = load_checkpoint(
+                resume_path,
                 model,
-                optimizer,
-                scaler,
-                device,
-                args.mode,
-                load_optimizer=not sft_from_pretrain,
+                config=cfg,
+                optimizer=optimizer,
+                scaler=scaler,
+                device=device,
+                expected_mode="pretrain",
+                tokenizer_fp=tok_fp,
+                load_optimizer=True,
+                load_data=True,
+                load_rng=(world == 1),
             )
-            if not loaded:
-                if args.mode == "sft":
-                    raise RuntimeError(
-                        f"Không thể tải checkpoint SFT/pretrain tương thích: {checkpoint}"
-                    )
-                start_step = 0
-                best_val = float("inf")
-
-            if sft_from_pretrain:
-                start_step = 0
-                best_val = float("inf")
-                print("Đã nạp trọng số pretrained; bắt đầu SFT với optimizer mới.")
-
-        if ddp:
-            # MoE top-1 routing means some expert parameters may be unused on
-            # a given rank. Let DDP detect/reduce those parameters instead of
-            # hanging on an all-reduce.
-            model = DDP(
-                model,
-                device_ids=[local_rank],
-                output_device=local_rank,
-                broadcast_buffers=False,
-                find_unused_parameters=True,
-            )
-
-        if rank == 0:
-            params = sum(
-                p.numel()
-                for p in (model.module if isinstance(model, DDP) else model).parameters()
-            )
-            print(f"Device: {device} | GPUs: {world}")
-            print(f"Vocab: {sp.vocab_size()} | Parameters: {params:,}")
-            print(
-                f"Context: {BLOCK_SIZE} | Effective tokens/step: "
-                f"{effective_tokens:,} | Max steps: {total_steps:,}"
-            )
-            print(f"Mode: {args.mode} | AMP: {amp_dtype if use_amp else 'off'}")
-            if args.mode == "sft":
-                print(f"Instruction examples: {len(rows):,} train | {len(val_rows):,} val")
-                print("SFT data: " + ", ".join(sft_paths))
-            elif args.rebuild_data:
-                print("Data pipeline: rebuilt")
-            else:
-                print("Data pipeline: reused when compatible")
-
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        t0 = time.time()
-        last_step = max(start_step - 1, 0)
-
-        for step in range(start_step, total_steps):
-            last_step = step
-            lr = get_lr(step, total_steps)
-            for group in optimizer.param_groups:
-                group["lr"] = lr
-
-            for micro_step in range(GRAD_ACCUM):
-                if args.mode == "pretrain":
-                    x, y = get_batch(train_data, device, rng)
-                else:
-                    x, y = get_sft_batch(rows, device, rng)
-
-                # Khi dùng DDP, chỉ đồng bộ gradient ở micro-step cuối cùng để tránh
-                # all-reduce lặp lại vô ích ở mỗi micro-step tích lũy gradient.
-                is_accumulating = ddp and (micro_step < GRAD_ACCUM - 1)
-                sync_context = model.no_sync() if is_accumulating else nullcontext()
-
-                with sync_context:
-                    with torch.autocast(
-                        device_type="cuda",
-                        dtype=amp_dtype,
-                        enabled=use_amp,
-                    ):
-                        _, loss, _ = model(x, y)
-                        loss = loss / GRAD_ACCUM
-
-                    if scaler.is_enabled():
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
-
-            if scaler.is_enabled():
-                scaler.unscale_(optimizer)
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-
-            if scaler.is_enabled():
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-
-            optimizer.zero_grad(set_to_none=True)
-
-            if step % EVAL_INTERVAL == 0 or step == total_steps - 1:
-                if args.mode == "pretrain":
-                    metrics = eval_pretrain(model, train_data, val_data, device, rng)
-                    train_loss = metrics["train"]
-                    local_val_loss = metrics["val"]
-                    ppl = math.exp(min(local_val_loss, 20))
-                    metric_text = (
-                        f"train {train_loss:.4f} | "
-                        f"val {local_val_loss:.4f} | ppl {ppl:.2f}"
-                    )
-                else:
-                    local_val_loss = eval_sft(model, val_rows, device, rng)
-                    metric_text = f"sft_loss {local_val_loss:.4f}"
-
-                val_loss = torch.tensor(
-                    [local_val_loss],
-                    dtype=torch.float32,
-                    device=device,
-                )
-                if ddp:
-                    dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-                val_loss = float(val_loss.item())
-
-                elapsed = time.time() - t0
-                if rank == 0:
-                    print(
-                        f"Step {step:6d} | lr {lr:.2e} | {metric_text} | "
-                        f"elapsed {elapsed:.1f}s"
-                    )
-
-                    if val_loss < best_val:
-                        best_val = val_loss
-                        save_checkpoint(
-                            best_path,
-                            model,
-                            optimizer,
-                            scaler,
-                            step + 1,
-                            best_val,
-                            sp.vocab_size(),
-                            args.mode,
-                            total_steps=total_steps,
-                            sft_val_indices=val_indices if args.mode == "sft" else None,
-                            rng=rng,
+            step = int(loaded.info.step)
+            tokens_seen = int(loaded.info.tokens_seen)
+            best_val = float(loaded.info.best_val)
+            history = list(loaded.history)
+            if world > 1 and loaded.rng_by_rank and len(loaded.rng_by_rank) > rank:
+                restore_rng_state(loaded.rng_by_rank[rank])
+            states = loaded.data_state
+            if states:
+                if isinstance(states, dict):
+                    states = [states]
+                if not isinstance(states, list) or len(states) != world:
+                    if not args.allow_data_restart:
+                        raise CheckpointError(
+                            f"Saved data state is for {len(states) if isinstance(states, list) else 1} "
+                            f"rank(s), current world size is {world}. "
+                            "Resume with the same GPU count or pass --allow-data-restart "
+                            "(this re-reads already-seen documents and is not exact)."
                         )
-                        print(f"  -> lưu model tốt nhất: {best_path}")
-
-                    save_checkpoint(
-                        last_path,
-                        model,
-                        optimizer,
-                        scaler,
-                        step + 1,
-                        best_val,
-                        sp.vocab_size(),
-                        args.mode,
-                        total_steps=total_steps,
-                        sft_val_indices=val_indices if args.mode == "sft" else None,
-                        rng=rng,
+                    print(
+                        "[WARN] World size changed: restarting the data stream from the "
+                        "beginning while keeping the optimizer/step state.",
+                        flush=True,
                     )
+                    data_mode = "restart"
+                else:
+                    packed.load_state_dict(states[rank])
+                    data_mode = "exact"
+            if is_main:
+                print(
+                    f"[resume] {resume_path} | step={step:,} tokens={tokens_seen:,} "
+                    f"best_val={best_val:.4f} data={data_mode}",
+                    flush=True,
+                )
 
-                if ddp:
-                    dist.barrier()
+    if not is_main:
+        logger = None  # keep JSONL single-writer
 
-        if rank == 0:
+    if tokens_seen >= args.plan_tokens:
+        if is_main:
+            print(
+                f"[done] Token plan already complete ({tokens_seen:,} >= {args.plan_tokens:,}).",
+                flush=True,
+            )
+        cleanup_distributed()
+        return 0
+
+    model.train()
+    started = time.time()
+    start_step = step
+    start_tokens = tokens_seen
+    skipped_steps = 0
+    micro_losses: List[float] = []
+    grad_norm_value = 0.0
+    last_log = time.time()
+    running_loss: List[float] = []
+    stopped_early = False
+
+    def save_last() -> None:
+        nonlocal history
+        states = gather_object(packed.state_dict())
+        rngs = gather_object(capture_rng_state())
+        if is_main:
             save_checkpoint(
                 last_path,
-                model,
-                optimizer,
-                scaler,
-                last_step + 1,
-                best_val,
-                sp.vocab_size(),
-                args.mode,
-                total_steps=total_steps,
-                sft_val_indices=val_indices if args.mode == "sft" else None,
-                rng=rng,
+                model=model,
+                config=cfg,
+                mode="pretrain",
+                step=step,
+                tokens_seen=tokens_seen,
+                best_val=best_val,
+                optimizer=optimizer,
+                scaler=scaler,
+                tokenizer_fp=tok_fp,
+                rng_state=rngs[0],
+                data_state=states,
+                train_args={
+                    "batch_size": args.batch_size,
+                    "grad_accum": args.grad_accum,
+                    "plan_tokens": args.plan_tokens,
+                    "warmup_tokens": args.warmup_tokens,
+                    "lr": args.lr,
+                    "min_lr": args.min_lr,
+                    "weight_decay": args.weight_decay,
+                    "amp": args.amp,
+                    "seed": args.seed,
+                    "world_size": world,
+                    "data_source": resolve_source(args)[0],
+                    "val_fraction": args.val_fraction,
+                    "shuffle_buffer": args.shuffle_buffer,
+                    "preset": args.preset,
+                },
+                history=history,
+                include_optimizer=True,
+                extra={"rng_by_rank": rngs, "world_size": world},
             )
-            print(f"Đã lưu checkpoint cuối: {last_path}")
-            print(f"Model tốt nhất: {best_path}")
+            if logger is not None:
+                logger.log(
+                    {
+                        "event": "checkpoint",
+                        "kind": "last",
+                        "step": step,
+                        "tokens": tokens_seen,
+                        "best_val": best_val,
+                        "data_mode": data_mode,
+                    }
+                )
+        barrier()
 
+    completed = False
+    try:
+        while step < total_steps:
+            lr = lr_at_tokens(tokens_seen, args.plan_tokens, args.warmup_tokens, args.lr, args.min_lr)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+            optimizer.zero_grad(set_to_none=True)
+            micro_losses = []
+            finite = True
+            for micro in range(args.grad_accum):
+                x_np, y_np = packed.next_batch(args.batch_size)
+                x = torch.from_numpy(x_np).to(device, non_blocking=True)
+                y = torch.from_numpy(y_np).to(device, non_blocking=True)
+                sync_context = (
+                    model.no_sync()
+                    if world > 1 and micro < args.grad_accum - 1
+                    else _NullContext()
+                )
+                with sync_context:
+                    with autocast_context(device, amp_dtype, use_amp):
+                        _, loss, _ = model(x, y)
+                        scaled = loss / args.grad_accum
+                    if not math.isfinite(float(loss.detach().float().item())):
+                        finite = False
+                    if scaler_enabled:
+                        scaler.scale(scaled).backward()
+                    else:
+                        scaled.backward()
+                micro_losses.append(float(loss.detach().float().item()))
+
+            tokens_seen += tokens_per_step
+            if scaler_enabled:
+                scaler.unscale_(optimizer)
+            if finite:
+                grad_norm_value = float(
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                )
+                if not math.isfinite(grad_norm_value):
+                    finite = False
+            if finite:
+                if scaler_enabled:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+            else:
+                skipped_steps += 1
+                if scaler_enabled:
+                    scaler.update()
+                if is_main:
+                    print(f"[WARN] step {step + 1}: non-finite loss/gradient; optimizer step skipped.", flush=True)
+            optimizer.zero_grad(set_to_none=True)
+            step += 1
+            step_loss = sum(micro_losses) / max(1, len(micro_losses))
+            running_loss.append(step_loss)
+
+            if args.log_every and step % args.log_every == 0:
+                now = time.time()
+                elapsed = max(1e-6, now - started)
+                done_tokens = max(1, tokens_seen - start_tokens)
+                rate = done_tokens / elapsed
+                remaining = max(0, total_steps - step)
+                eta = remaining * tokens_per_step / max(1.0, rate)
+                avg_loss = sum(running_loss) / len(running_loss)
+                running_loss = []
+                if is_main:
+                    alloc, peak = gpu_memory(device)
+                    print(
+                        f"step {step:>7,}/{total_steps:,} | loss {avg_loss:.4f} | "
+                        f"lr {lr:.2e} | gnorm {grad_norm_value:.2f} | "
+                        f"{rate:,.0f} tok/s | ETA {_format_seconds(eta)} | "
+                        f"gpu {alloc:.1f}/{peak:.1f} GiB",
+                        flush=True,
+                    )
+                    logger.log(
+                        {
+                            "event": "train",
+                            "step": step,
+                            "tokens": tokens_seen,
+                            "loss": avg_loss,
+                            "lr": lr,
+                            "grad_norm": grad_norm_value,
+                            "tokens_per_sec": rate,
+                            "skipped_steps": skipped_steps,
+                        }
+                    )
+
+            should_eval = args.eval_every > 0 and (step % args.eval_every == 0 or step == total_steps)
+            if should_eval:
+                val_loss = evaluate(
+                    model,
+                    val_data,
+                    cfg,
+                    device,
+                    args.eval_iters,
+                    args.batch_size,
+                    use_amp,
+                    amp_dtype,
+                    seed=args.seed + step,
+                )
+                improved = val_loss < best_val - 1e-4
+                if improved:
+                    best_val = val_loss
+                if is_main:
+                    print(
+                        f"[eval] step {step:,} | val_loss {val_loss:.4f} | best {best_val:.4f}"
+                        + (" *" if improved else ""),
+                        flush=True,
+                    )
+                    logger.log(
+                        {
+                            "event": "eval",
+                            "step": step,
+                            "tokens": tokens_seen,
+                            "val_loss": val_loss,
+                            "best_val": best_val,
+                            "improved": improved,
+                        }
+                    )
+                history.append(
+                    {"step": step, "tokens": tokens_seen, "val_loss": val_loss, "best_val": best_val}
+                )
+                if improved and is_main:
+                    save_checkpoint(
+                        best_path,
+                        model=model,
+                        config=cfg,
+                        mode="pretrain",
+                        step=step,
+                        tokens_seen=tokens_seen,
+                        best_val=best_val,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        tokenizer_fp=tok_fp,
+                        rng_state=None,
+                        data_state=None,
+                        train_args={"plan_tokens": args.plan_tokens, "preset": args.preset},
+                        history=history,
+                        include_optimizer=False,
+                    )
+                    if logger is not None:
+                        logger.log({"event": "checkpoint", "kind": "best", "step": step, "val_loss": val_loss})
+
+            if args.save_every and step % args.save_every == 0:
+                save_last()
+
+            if stop.requested:
+                if is_main:
+                    print("[stop] Signal received: saving checkpoint and exiting.", flush=True)
+                save_last()
+                stopped_early = True
+                break
+
+        if not stopped_early:
+            save_last()
+        completed = True
     finally:
+        if is_main and completed:
+            elapsed = max(1e-6, time.time() - started)
+            trained_steps = step - start_step
+            trained_tokens = max(0, tokens_seen - start_tokens)
+            print(
+                f"[done] steps={step:,} (+{trained_steps:,}) tokens={tokens_seen:,} "
+                f"(+{trained_tokens:,}) best_val={best_val:.4f} "
+                f"rate={trained_tokens / elapsed:,.0f} tok/s",
+                flush=True,
+            )
+            if logger is not None:
+                logger.log(
+                    {
+                        "event": "finish",
+                        "step": step,
+                        "tokens": tokens_seen,
+                        "best_val": best_val,
+                        "skipped_steps": skipped_steps,
+                    }
+                )
         cleanup_distributed()
+    return 0
+
+
+class _NullContext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,11 +1,11 @@
-# Running the English edition on Kaggle (2 × Tesla T4)
+# Running myAI on Kaggle (2 × Tesla T4)
 
-This is the practical Kaggle guide for `english/`. It assumes you have a Kaggle
-account with phone verification (needed for Internet access) and GPU quota.
+This is the practical Kaggle guide for the English-only `myAI` project. It
+assumes you have a Kaggle account with phone verification (needed for Internet
+access) and GPU quota.
 
-**Do not run the original Vietnamese `train.py`.** It expects a different data
-format and its bins are not compatible with the English edition. Only the
-`english.*` modules are covered here.
+All commands run from the repository root and use the `english.*` modules. The
+legacy Vietnamese training scripts and artifacts no longer exist.
 
 ---
 
@@ -28,7 +28,7 @@ and `RUN_SFT`, which all default to `False`. Flip only the ones you need.
 ## 2. Install
 
 ```bash
-pip install -q -r requirements_en.txt
+pip install -q -r requirements.txt
 ```
 
 `datasets` pulls `pyarrow`, which is required for streaming parquet shards of
@@ -233,12 +233,11 @@ interactive session but not in committed runs.
 | Web search returns nothing | Internet is off, DuckDuckGo is rate-limiting, or the query found no pages. Chat falls back to local RAG. |
 | Loss becomes `nan` | The scaler skips bad steps automatically; if it persists, lower `--lr`, check the data, and resume from the last finite checkpoint. |
 | Session ends mid-run | Nothing is lost if `--save-every` fired; otherwise the last saved step is used. Resume with the same command. |
-| Original Vietnamese tests fail | They are unrelated to `english/`; run `python test_audit.py` on a clean checkout to confirm. |
 
 ## 11. Exact command summary
 
 ```bash
-pip install -r requirements_en.txt
+pip install -r requirements.txt
 
 python -m english.tokenizer --train --sample-mb 200 --vocab-size 32768
 
@@ -262,4 +261,4 @@ python -m unittest discover -s english/tests -t . -v
 ```
 
 All artifacts stay under `tokenizer_en/`, `checkpoints_en/`, `data_en/`,
-`runs_en/` and `memory_en/`; the Vietnamese edition remains untouched.
+`runs_en/` and `memory_en/`. The repository is English-only.

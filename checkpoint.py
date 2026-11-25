@@ -3,8 +3,8 @@
 Every English checkpoint carries an explicit ``edition: "en"`` marker plus the
 architecture version, the model configuration, the tokenizer fingerprint, the
 AMP scaler state, all RNG states and the resumable data-stream state.  This is
-deliberately stricter than the legacy Vietnamese checkpoints, which lacked
-several of these fields.
+deliberately stricter than earlier checkpoint formats, which lacked several of
+these fields.
 
 Only trusted checkpoint files should be loaded: the payload includes Python
 objects (NumPy RNG tuples), so ``weights_only=False`` is required.

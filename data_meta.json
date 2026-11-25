@@ -1,9 +1,0 @@
-{
-  "source": {
-    "size": 1481876307,
-    "mtime_ns": 1794646149183525338
-  },
-  "vocab_size": 16384,
-  "val_ratio": 0.01,
-  "format": 3
-}

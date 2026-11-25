@@ -1,13 +1,9 @@
-"""English edition of the myAI project.
+"""English-only GPT project.
 
-This package is completely separate from the original Vietnamese modules at the
-repository root.  It provides a configurable GPT-style model, an English BPE
+The repository provides a configurable GPT-style model, an English BPE
 tokenizer, a resumable FineWeb-Edu streaming pipeline, pretraining, SFT,
-inference, RAG and web search.
-
-Only this package and the English artifact directories are created by the
-English edition.  Original Vietnamese source files, tokenizers, checkpoints,
-datasets and memory stores are never modified.
+inference, RAG and web search.  All source code lives in this package and all
+generated artifacts use the sibling ``*_en`` directories.
 """
 
 from .config import (
