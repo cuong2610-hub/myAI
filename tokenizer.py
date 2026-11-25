@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import sentencepiece as spm
 
-from .config import (
+from config import (
     ASSISTANT_ID,
     BOS_ID,
     DEFAULT_DATASET,
@@ -110,7 +110,7 @@ def load_tokenizer(
     if not path.exists():
         raise FileNotFoundError(
             f"English tokenizer not found at {path}. Train it first with:\n"
-            "  python -m english.tokenizer --train --sample-mb 200"
+            "  python tokenizer.py --train --sample-mb 200"
         )
     try:
         sp = spm.SentencePieceProcessor(model_file=str(path))
@@ -264,7 +264,7 @@ def _sample_corpus(
     max_chars_per_line: int = 2048,
 ) -> Dict[str, Any]:
     """Stream a bounded English sample for tokenizer training (no full download)."""
-    from .data import DocumentStream, RetryConfig  # lazy: avoids import cycle
+    from data import DocumentStream, RetryConfig  # lazy: avoids import cycle
 
     target = max(1, int(sample_mb)) * 1024 * 1024
     stream = DocumentStream(

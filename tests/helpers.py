@@ -10,9 +10,9 @@ from typing import Tuple
 
 import torch
 
-from english.config import TINY_CONFIG, ModelConfig
-from english.model import GPT
-from english.tokenizer import load_tokenizer, train_tokenizer
+from config import TINY_CONFIG, ModelConfig
+from model import GPT
+from tokenizer import load_tokenizer, train_tokenizer
 
 WORDS = (
     "the quick brown fox jumps over lazy dog machine learning transformer "

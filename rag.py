@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-from .config import DEFAULT_MEMORY_DIR
+from config import DEFAULT_MEMORY_DIR
 
 DEFAULT_TTL = 7 * 86400  # 7 days
 DEFAULT_CONTEXT_CHARS = 3_000

@@ -8,8 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from english.config import BOS_ID, EOS_ID
-from english.data import (
+from config import BOS_ID, EOS_ID
+from data import (
     DocumentStream,
     PackedTokenStream,
     RetryConfig,
@@ -20,7 +20,7 @@ from english.data import (
     is_val_document,
     load_val_tokens,
 )
-from english.tests.helpers import build_tokenizer, make_temp_dir, remove_temp_dir
+from tests.helpers import build_tokenizer, make_temp_dir, remove_temp_dir
 
 RETRY = RetryConfig(max_retries=1, base_delay=0.0)
 
@@ -92,7 +92,7 @@ class DataTests(unittest.TestCase):
         state = a.state_dict()
         state["world_size"] = 2
         b = self.make_stream()
-        from english.data import DataStreamError
+        from data import DataStreamError
 
         with self.assertRaises(DataStreamError):
             b.load_state_dict(state)
@@ -135,7 +135,7 @@ class DataTests(unittest.TestCase):
         stream = PackedTokenStream(self.make_stream(), self.sp, block_size=32)
         state = stream.state_dict()
         other = PackedTokenStream(self.make_stream(), self.sp, block_size=64)
-        from english.data import DataStreamError
+        from data import DataStreamError
 
         with self.assertRaises(DataStreamError):
             other.load_state_dict(state)

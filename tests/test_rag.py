@@ -6,8 +6,8 @@ import json
 import time
 import unittest
 
-from english.rag import RagStore, format_context, sanitize_text, tokenize
-from english.tests.helpers import make_temp_dir, remove_temp_dir
+from rag import RagStore, format_context, sanitize_text, tokenize
+from tests.helpers import make_temp_dir, remove_temp_dir
 
 
 class RagTests(unittest.TestCase):

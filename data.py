@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
 import numpy as np
 
-from .config import (
+from config import (
     BOS_ID,
     DEFAULT_DATASET,
     DEFAULT_DATASET_CONFIG,

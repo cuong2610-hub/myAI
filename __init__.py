@@ -6,7 +6,7 @@ inference, RAG and web search.  All source code lives in this package and all
 generated artifacts use the sibling ``*_en`` directories.
 """
 
-from .config import (
+from config import (
     ARCH_VERSION,
     BASE_CONFIG,
     DEFAULT_CHECKPOINT_DIR,

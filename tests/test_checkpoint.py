@@ -7,7 +7,7 @@ import unittest
 
 import torch
 
-from english.checkpoint import (
+from checkpoint import (
     CheckpointError,
     atomic_save,
     checkpoint_summary,
@@ -17,10 +17,10 @@ from english.checkpoint import (
     peek_checkpoint,
     save_checkpoint,
 )
-from english.config import TINY_CONFIG, ModelConfig
-from english.model import GPT
-from english.tests.helpers import make_temp_dir, remove_temp_dir
-from english.utils import build_optimizer, capture_rng_state
+from config import TINY_CONFIG, ModelConfig
+from model import GPT
+from tests.helpers import make_temp_dir, remove_temp_dir
+from utils import build_optimizer, capture_rng_state
 
 FP = {"sha256": "a" * 64, "size": 1234, "path": "tokenizer_en/tokenizer.model"}
 

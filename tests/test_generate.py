@@ -7,8 +7,8 @@ import unittest
 import torch
 import torch.nn as nn
 
-from english.config import EOS_ID, PAD_ID, TINY_CONFIG
-from english.generate import (
+from config import EOS_ID, PAD_ID, TINY_CONFIG
+from generate import (
     GenerationConfig,
     TextStreamer,
     apply_repetition_penalty,
@@ -18,8 +18,8 @@ from english.generate import (
     generate_text,
     sample_token,
 )
-from english.model import GPT
-from english.tests.helpers import build_tokenizer, make_temp_dir, remove_temp_dir
+from model import GPT
+from tests.helpers import build_tokenizer, make_temp_dir, remove_temp_dir
 
 
 class FakeEos(nn.Module):

@@ -6,7 +6,7 @@ import json
 import unittest
 from unittest import mock
 
-from english import web_search
+import web_search
 
 
 DDG_HTML = """

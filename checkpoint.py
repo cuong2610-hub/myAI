@@ -23,8 +23,8 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from .config import ARCH_VERSION, ModelConfig
-from .utils import capture_rng_state, restore_rng_state, unwrap_model
+from config import ARCH_VERSION, ModelConfig
+from utils import capture_rng_state, restore_rng_state, unwrap_model
 
 EDITION = "en"
 CHECKPOINT_FORMAT = 1

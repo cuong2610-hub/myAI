@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import ModelConfig
+from config import ModelConfig
 
 KVCache = List[Tuple[torch.Tensor, torch.Tensor]]
 

@@ -13,9 +13,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from english.config import TINY_CONFIG
-from english.model import GPT
-from english.utils import (
+from config import TINY_CONFIG
+from model import GPT
+from utils import (
     JsonlLogger,
     autocast_context,
     build_optimizer,
@@ -133,7 +133,7 @@ class UtilsTests(unittest.TestCase):
         self.assertEqual(human_bytes(2048), "2.0 KiB")
 
     def test_train_parser_defaults_and_overrides(self):
-        from english.train import build_parser, resolve_config
+        from train import build_parser, resolve_config
 
         args = build_parser().parse_args([])
         self.assertEqual(args.preset, "base")

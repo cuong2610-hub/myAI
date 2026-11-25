@@ -11,10 +11,10 @@ from pathlib import Path
 
 import torch
 
-from english.checkpoint import peek_checkpoint, save_checkpoint
-from english.config import TINY_CONFIG
-from english.model import GPT
-from english.sft import (
+from checkpoint import peek_checkpoint, save_checkpoint
+from config import TINY_CONFIG
+from model import GPT
+from sft import (
     SftExample,
     SftStream,
     collate,
@@ -23,8 +23,8 @@ from english.sft import (
     split_examples,
     truncate_example,
 )
-from english.tests.helpers import build_tokenizer, make_temp_dir, remove_temp_dir, write_corpus
-from english.tokenizer import load_tokenizer, tokenizer_fingerprint, train_tokenizer
+from tests.helpers import build_tokenizer, make_temp_dir, remove_temp_dir, write_corpus
+from tokenizer import load_tokenizer, tokenizer_fingerprint, train_tokenizer
 
 
 def make_rows(count: int = 16):

@@ -6,13 +6,13 @@ import unittest
 
 import torch
 
-from english.chat import ChatConfig, ChatSession, load_chat, resolve_checkpoint
-from english.checkpoint import save_checkpoint
-from english.config import TINY_CONFIG
-from english.model import GPT
-from english.rag import RagStore
-from english.tests.helpers import build_tokenizer, make_temp_dir, remove_temp_dir
-from english.tokenizer import decode, encode, tokenizer_fingerprint
+from chat import ChatConfig, ChatSession, load_chat, resolve_checkpoint
+from checkpoint import save_checkpoint
+from config import TINY_CONFIG
+from model import GPT
+from rag import RagStore
+from tests.helpers import build_tokenizer, make_temp_dir, remove_temp_dir
+from tokenizer import decode, encode, tokenizer_fingerprint
 
 
 class ChatTests(unittest.TestCase):

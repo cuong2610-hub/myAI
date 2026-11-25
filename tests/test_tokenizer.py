@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from english.config import (
+from config import (
     ASSISTANT_ID,
     BOS_ID,
     EOS_ID,
@@ -14,8 +14,8 @@ from english.config import (
     UNK_ID,
     USER_ID,
 )
-from english.tests.helpers import build_tokenizer, make_temp_dir, remove_temp_dir
-from english.tokenizer import (
+from tests.helpers import build_tokenizer, make_temp_dir, remove_temp_dir
+from tokenizer import (
     SPECIAL_IDS,
     TokenizerError,
     build_chat_ids,

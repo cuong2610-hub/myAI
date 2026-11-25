@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import unittest
 
-from english.agent import RouteResult, needs_web, retrieve_context
-from english.rag import RagStore
-from english.tests.helpers import make_temp_dir, remove_temp_dir
+from agent import RouteResult, needs_web, retrieve_context
+from rag import RagStore
+from tests.helpers import make_temp_dir, remove_temp_dir
 
 
 class AgentTests(unittest.TestCase):

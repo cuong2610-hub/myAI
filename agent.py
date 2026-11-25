@@ -7,8 +7,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
-from .rag import RagStore, format_context
-from .web_search import collect_sources
+from rag import RagStore, format_context
+from web_search import collect_sources
 
 CURRENT_HINTS = (
     "today",

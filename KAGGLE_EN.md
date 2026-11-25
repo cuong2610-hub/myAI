@@ -4,8 +4,9 @@ This is the practical Kaggle guide for the English-only `myAI` project. It
 assumes you have a Kaggle account with phone verification (needed for Internet
 access) and GPU quota.
 
-All commands run from the repository root and use the `english.*` modules. The
-legacy Vietnamese training scripts and artifacts no longer exist.
+All commands run from the repository root and use the flat root-level modules
+(`train.py`, `sft.py`, `chat.py`, `tokenizer.py`). The legacy Vietnamese
+training scripts and the former package directory no longer exist.
 
 ---
 
@@ -51,9 +52,9 @@ The cache can grow to several GB; delete it between runs if disk runs low.
 ## 4. Smoke test first (CPU or GPU, ~1 minute)
 
 ```bash
-python -m english.train --smoke-test --max-steps 4
-python -m english.sft   --smoke-test --max-steps 2
-python -m english.chat  --smoke-test --prompt "Hello" --no-rag --no-web
+python train.py --smoke-test --max-steps 4
+python sft.py   --smoke-test --max-steps 2
+python chat.py  --smoke-test --prompt "Hello" --no-rag --no-web
 ```
 
 These train a 512-token smoke tokenizer and a 393,856-parameter model under
@@ -61,14 +62,14 @@ These train a 512-token smoke tokenizer and a 393,856-parameter model under
 tokenizer or checkpoints. Also run the CPU suite once:
 
 ```bash
-python -m unittest discover -s english/tests -t . -v
+python -m unittest discover -s tests -v
 ```
 
 ## 5. Train the real tokenizer (once)
 
 ```bash
-python -m english.tokenizer --train --sample-mb 200 --vocab-size 32768
-python -m english.tokenizer --inspect
+python tokenizer.py --train --sample-mb 200 --vocab-size 32768
+python tokenizer.py --inspect
 ```
 
 This streams a 200 MB English sample, trains a 32K SentencePiece BPE model,
@@ -85,7 +86,7 @@ resume: the checkpoint stores the tokenizer SHA-256 and refuses a mismatch.
 ### 6.1 Two GPUs (recommended)
 
 ```bash
-torchrun --nproc_per_node=2 -m english.train \
+torchrun --nproc_per_node=2 -m train \
   --preset base \
   --plan-tokens 500000000 \
   --batch-size 8 --grad-accum 4 \
@@ -106,7 +107,7 @@ torchrun --nproc_per_node=2 -m english.train \
 ### 6.2 Resume in a later session
 
 ```bash
-torchrun --nproc_per_node=2 -m english.train \
+torchrun --nproc_per_node=2 -m train \
   --preset base --plan-tokens 500000000 \
   --batch-size 8 --grad-accum 4 --amp fp16 \
   --expect-params 124278528 \
@@ -189,7 +190,7 @@ Alternatively, keep the same notebook version and rely on
 ## 8. SFT
 
 ```bash
-python -m english.sft \
+python sft.py \
   --init checkpoints_en/pretrain_best.pth \
   --data data/sft_sample_en.jsonl \
   --epochs 3 --batch-size 4 --grad-accum 1 \
@@ -206,17 +207,17 @@ by prompt key, so duplicate prompts do not leak across train/validation.
 
 ```bash
 # one-shot, no network
-python -m english.chat --prompt "Explain attention in one paragraph." --no-web
+python chat.py --prompt "Explain attention in one paragraph." --no-web
 
 # streaming chat with one GPU and live web search available
-python -m english.chat --device cuda
+python chat.py --device cuda
 
 # force a web lookup this turn and show sources
-python -m english.chat --prompt "/web latest Python release" --show-sources
+python chat.py --prompt "/web latest Python release" --show-sources
 ```
 
 In a notebook, prefer one-shot prompts or a small Python loop using
-`english.chat.load_chat(...).reply(...)`; `input()` works in Kaggle's
+`chat.load_chat(...).reply(...)`; `input()` works in Kaggle's
 interactive session but not in committed runs.
 
 ## 10. Troubleshooting
@@ -239,25 +240,25 @@ interactive session but not in committed runs.
 ```bash
 pip install -r requirements.txt
 
-python -m english.tokenizer --train --sample-mb 200 --vocab-size 32768
+python tokenizer.py --train --sample-mb 200 --vocab-size 32768
 
-python -m english.train --smoke-test --max-steps 4
-python -m english.sft   --smoke-test --max-steps 2
-python -m english.chat  --smoke-test --prompt "Hello" --no-rag --no-web
+python train.py --smoke-test --max-steps 4
+python sft.py   --smoke-test --max-steps 2
+python chat.py  --smoke-test --prompt "Hello" --no-rag --no-web
 
-torchrun --nproc_per_node=2 -m english.train \
+torchrun --nproc_per_node=2 -m train \
   --preset base --plan-tokens 500000000 \
   --batch-size 8 --grad-accum 4 --amp fp16 \
   --expect-params 124278528 \
   --eval-every 250 --save-every 250 --log-every 10
 
-python -m english.sft \
+python sft.py \
   --init checkpoints_en/pretrain_best.pth \
   --data data/sft_sample_en.jsonl \
   --epochs 3 --batch-size 4 --amp auto
 
-python -m english.chat --prompt "Explain what a transformer is." --no-web
-python -m unittest discover -s english/tests -t . -v
+python chat.py --prompt "Explain what a transformer is." --no-web
+python -m unittest discover -s tests -v
 ```
 
 All artifacts stay under `tokenizer_en/`, `checkpoints_en/`, `data_en/`,

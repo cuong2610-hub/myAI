@@ -7,8 +7,8 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from english.config import BASE_CONFIG, TINY_CONFIG, ModelConfig, get_preset
-from english.model import GPT, build_rope_cache
+from config import BASE_CONFIG, TINY_CONFIG, ModelConfig, get_preset
+from model import GPT, build_rope_cache
 
 
 class ModelTests(unittest.TestCase):

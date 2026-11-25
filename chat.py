@@ -10,18 +10,18 @@ from typing import Dict, Iterator, List, Optional, Sequence
 
 import torch
 
-from .agent import RouteResult, retrieve_context
-from .checkpoint import peek_checkpoint
-from .config import (
+from agent import RouteResult, retrieve_context
+from checkpoint import peek_checkpoint
+from config import (
     BOS_ID,
     DEFAULT_CHECKPOINT_DIR,
     DEFAULT_TOKENIZER_DIR,
     ModelConfig,
 )
-from .generate import GenerationConfig, TextStreamer, generate_stream
-from .model import GPT
-from .rag import RagStore, format_context
-from .tokenizer import encode, load_tokenizer
+from generate import GenerationConfig, TextStreamer, generate_stream
+from model import GPT
+from rag import RagStore, format_context
+from tokenizer import encode, load_tokenizer
 
 DEFAULT_SYSTEM = (
     "You are a helpful, concise assistant. Answer in English. "
@@ -278,7 +278,7 @@ def load_chat(
     sp = load_tokenizer(tokenizer, expected_vocab=cfg.vocab_size)
     dev = resolve_device(device)
     model = GPT(cfg)
-    from .checkpoint import load_model_weights
+    from checkpoint import load_model_weights
 
     load_model_weights(
         ckpt_path,

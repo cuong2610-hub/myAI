@@ -13,8 +13,8 @@ from typing import Iterable, Iterator, List, Optional, Sequence
 import torch
 import torch.nn as nn
 
-from .config import ASSISTANT_ID, BOS_ID, EOS_ID, PAD_ID, SYSTEM_ID, USER_ID
-from .tokenizer import decode as decode_ids
+from config import ASSISTANT_ID, BOS_ID, EOS_ID, PAD_ID, SYSTEM_ID, USER_ID
+from tokenizer import decode as decode_ids
 
 STOP_IDS = (PAD_ID, EOS_ID, BOS_ID, USER_ID, ASSISTANT_ID, SYSTEM_ID)
 

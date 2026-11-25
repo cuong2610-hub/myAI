@@ -11,7 +11,7 @@ ARCH_VERSION = 1
 """Architecture version for English checkpoints.  Kept independent of any legacy
 checkpoint format so the two families cannot be confused."""
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parent
 
 DEFAULT_TOKENIZER_DIR = REPO_ROOT / "tokenizer_en"
 DEFAULT_CHECKPOINT_DIR = REPO_ROOT / "checkpoints_en"
@@ -23,7 +23,7 @@ DEFAULT_DATASET = "HuggingFaceFW/fineweb-edu"
 DEFAULT_DATASET_CONFIG = "default"
 DEFAULT_SPLIT = "train"
 
-# Special token ids are fixed by english.tokenizer.  Kept here so the model
+# Special token ids are fixed by tokenizer.py.  Kept here so the model
 # config can validate them without importing sentencepiece.
 PAD_ID = 0
 UNK_ID = 1

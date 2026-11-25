@@ -18,14 +18,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from .checkpoint import (
+from checkpoint import (
     CheckpointError,
     load_checkpoint,
     load_model_weights,
     peek_checkpoint,
     save_checkpoint,
 )
-from .config import (
+from config import (
     BOS_ID,
     DEFAULT_CHECKPOINT_DIR,
     DEFAULT_RUNS_DIR,
@@ -34,14 +34,14 @@ from .config import (
     ModelConfig,
     ensure_dir,
 )
-from .model import GPT
-from .tokenizer import (
+from model import GPT
+from tokenizer import (
     build_chat_ids,
     load_tokenizer,
     normalize_messages,
     tokenizer_fingerprint,
 )
-from .utils import (
+from utils import (
     JsonlLogger,
     StopFlag,
     autocast_context,
@@ -64,7 +64,7 @@ from .utils import (
     unwrap_model,
 )
 
-DEFAULT_SFT_DATA = Path(__file__).resolve().parents[1] / "data" / "sft_sample_en.jsonl"
+DEFAULT_SFT_DATA = Path(__file__).resolve().parent / "data" / "sft_sample_en.jsonl"
 
 
 @dataclass
@@ -391,7 +391,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not tokenizer_path.exists():
         raise SystemExit(
             f"Tokenizer not found: {tokenizer_path}\n"
-            "Train it with: python -m english.tokenizer --train --sample-mb 200"
+            "Train it with: python tokenizer.py --train --sample-mb 200"
         )
     sp = load_tokenizer(tokenizer_path, expected_vocab=cfg.vocab_size)
     tok_fp = tokenizer_fingerprint(tokenizer_path)

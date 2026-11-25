@@ -2,11 +2,11 @@
 
 Single-GPU example::
 
-    python -m english.train --preset base --amp auto
+    python train.py --preset base --amp auto
 
 Dual-T4 (Kaggle) example::
 
-    torchrun --nproc_per_node=2 -m english.train \
+    torchrun --nproc_per_node=2 -m train \
         --preset base --plan-tokens 5000000000 --amp fp16
 
 The script never downloads the full corpus: Hugging Face ``streaming=True`` is
@@ -31,12 +31,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .checkpoint import (
+from checkpoint import (
     CheckpointError,
     load_checkpoint,
     save_checkpoint,
 )
-from .config import (
+from config import (
     BASE_CONFIG,
     DEFAULT_CHECKPOINT_DIR,
     DEFAULT_DATA_DIR,
@@ -51,7 +51,7 @@ from .config import (
     get_preset,
     with_overrides,
 )
-from .data import (
+from data import (
     DocumentStream,
     PackedTokenStream,
     RetryConfig,
@@ -60,15 +60,15 @@ from .data import (
     build_val_tokens,
     load_val_tokens,
 )
-from .model import GPT
-from .tokenizer import (
+from model import GPT
+from tokenizer import (
     BOS_ID,
     EOS_ID,
     load_tokenizer,
     tokenizer_fingerprint,
     train_tokenizer,
 )
-from .utils import (
+from utils import (
     JsonlLogger,
     StopFlag,
     autocast_context,
@@ -342,7 +342,7 @@ def prepare_assets(
                 raise FileNotFoundError(
                     f"English tokenizer not found: {tokenizer_path}\n"
                     "Train it first:\n"
-                    "  python -m english.tokenizer --train --sample-mb 200 --vocab-size 32768"
+                    "  python tokenizer.py --train --sample-mb 200 --vocab-size 32768"
                 )
             sp = load_tokenizer(tokenizer_path, expected_vocab=cfg.vocab_size)
             if args.smoke_test:

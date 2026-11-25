@@ -7,8 +7,8 @@ import io
 import os
 import unittest
 
-from english.checkpoint import peek_checkpoint
-from english.train import main as train_main
+from checkpoint import peek_checkpoint
+from train import main as train_main
 
 
 class TrainSmokeTests(unittest.TestCase):
@@ -16,13 +16,13 @@ class TrainSmokeTests(unittest.TestCase):
     def setUpClass(cls):
         for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
             os.environ.pop(key, None)
-        from english.tests.helpers import make_temp_dir
+        from tests.helpers import make_temp_dir
 
         cls.tmp = make_temp_dir()
 
     @classmethod
     def tearDownClass(cls):
-        from english.tests.helpers import remove_temp_dir
+        from tests.helpers import remove_temp_dir
 
         remove_temp_dir(cls.tmp)
 

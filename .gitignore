@@ -11,7 +11,7 @@ __pycache__/
 _gen_new/out/
 memory/
 
-# English edition artifacts (additive; the original edition is untouched)
+# English artifact directories (flat English-only layout)
 checkpoints_en/
 data_en/
 tokenizer_en/
